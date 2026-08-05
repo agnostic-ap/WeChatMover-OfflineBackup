@@ -7,11 +7,19 @@ struct StatusCardView: View {
     var body: some View {
         GroupBox("状态面板") {
             VStack(alignment: .leading, spacing: 8) {
-                row("当前模式", vm.modeDescription)
-                row("数据总大小", DiskProbe.formatBytes(vm.totalDataSize))
+                if vm.isLoading {
+                    HStack {
+                        ProgressView().controlSize(.small)
+                        Text("正在检测本机环境…").foregroundStyle(.secondary)
+                    }
+                    .font(.callout)
+                }
+                row("当前模式", vm.isLoading ? "加载中…" : vm.modeDescription)
+                row("数据总大小", vm.isLoading ? "加载中…" : DiskProbe.formatBytes(vm.totalDataSize))
                 row("内置盘剩余", DiskProbe.formatBytes(DiskProbe.freeSpace(path: NSHomeDirectory()) ?? 0))
-                row("微信版本", vm.wechat.version ?? "未安装")
-                row("签名状态", signatureText)
+                row("微信来源", vm.isLoading ? "加载中…" : vm.sourceDescription)
+                row("微信版本", vm.isLoading ? "加载中…" : (vm.wechat.version ?? "未安装"))
+                row("签名状态", vm.isLoading ? "加载中…" : signatureText)
                 if let fs = vm.targetFSType {
                     row("目标卷格式", fs + (vm.isTargetAPFS ? " ✅" : " ⚠️ 非 APFS"))
                     row("目标卷剩余", DiskProbe.formatBytes(vm.targetFreeSpace ?? 0))

@@ -191,3 +191,62 @@ private func makeDataDir(root: URL, _ relative: String, fileSizes: [Int] = [100,
         }
     }
 }
+
+
+// MARK: - 安装/来源检测（Bug 2 回归：只依赖 /Applications/WeChat.app 本体）
+
+/// 造一个假 .app（Contents/Info.plist，可选 MASReceipt）。
+private func makeFakeApp(root: URL, version: String?, masReceipt: Bool) throws -> URL {
+    let contents = root.appendingPathComponent("WeChat.app/Contents", isDirectory: true)
+    try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+    if let version {
+        try NSDictionary(dictionary: ["CFBundleShortVersionString": version])
+            .write(to: contents.appendingPathComponent("Info.plist"))
+    }
+    if masReceipt {
+        let receiptDir = contents.appendingPathComponent("_MASReceipt", isDirectory: true)
+        try FileManager.default.createDirectory(at: receiptDir, withIntermediateDirectories: true)
+        try Data().write(to: receiptDir.appendingPathComponent("receipt"))
+    }
+    return root.appendingPathComponent("WeChat.app")
+}
+
+@Test func detectOfficialDMGVersion() throws {
+    try withTempDir { root in
+        let app = try makeFakeApp(root: root, version: "4.1.12", masReceipt: false)
+        let info = WeChatDetector.detect(appURL: app)
+        #expect(info.isInstalled)
+        #expect(info.version == "4.1.12")
+        #expect(!info.isAppStoreVersion)
+    }
+}
+
+@Test func detectAppStoreVersion() throws {
+    try withTempDir { root in
+        let app = try makeFakeApp(root: root, version: "4.1.12", masReceipt: true)
+        let info = WeChatDetector.detect(appURL: app)
+        #expect(info.isInstalled)
+        #expect(info.isAppStoreVersion)
+    }
+}
+
+@Test func detectNotInstalled() throws {
+    try withTempDir { root in
+        let info = WeChatDetector.detect(appURL: root.appendingPathComponent("NoSuch.app"))
+        #expect(!info.isInstalled)
+        #expect(info.version == nil)
+        #expect(!info.isAppStoreVersion)
+    }
+}
+
+/// 本机真实环境只读验证：/Applications/WeChat.app 应识别为「已安装 / 官网 DMG 版」。
+/// 仅在存在该 App 的机器上运行，其他机器自动跳过。
+@Test(
+    .enabled(if: FileManager.default.fileExists(atPath: "/Applications/WeChat.app"))
+)
+func detectRealWeChat() {
+    let info = WeChatDetector.detect()
+    #expect(info.isInstalled)
+    #expect(info.version != nil)
+    #expect(!info.isAppStoreVersion)  // 本机为官网 DMG 版
+}

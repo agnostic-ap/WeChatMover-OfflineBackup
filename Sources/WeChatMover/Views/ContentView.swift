@@ -9,11 +9,11 @@ struct ContentView: View {
                 .font(.title2).bold()
 
             // App Store 版拦截
-            if vm.wechat.isInstalled && vm.wechat.isAppStoreVersion {
+            if !vm.isLoading && vm.wechat.isInstalled && vm.wechat.isAppStoreVersion {
                 masBanner
             }
 
-            if !vm.wechat.isInstalled {
+            if !vm.isLoading && !vm.wechat.isInstalled {
                 Label("未在 /Applications 检测到微信。", systemImage: "xmark.octagon.fill")
                     .foregroundStyle(.red)
             }

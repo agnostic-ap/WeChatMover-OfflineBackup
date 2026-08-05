@@ -48,6 +48,14 @@ final class AppViewModel: ObservableObject {
     @Published var showMigrateSheet = false
     @Published var showNonAPFSAlert = false
     @Published var lastError: String? = nil
+    /// 首次/刷新探测进行中：UI 显示"加载中…"占位，避免把默认值误显示成"未安装"。
+    @Published var isLoading = false
+
+    /// 微信来源展示文案。
+    var sourceDescription: String {
+        guard wechat.isInstalled else { return "—" }
+        return wechat.isAppStoreVersion ? "App Store 版" : "官网 DMG 版"
+    }
 
     private let containerRoot = WeChatPaths.defaultContainerRoot
 
@@ -90,38 +98,73 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - 刷新
 
-    func refresh() {
-        var info = WeChatDetector.detect()
-        if info.isInstalled {
-            info.signatureValid = WeChatDetector.checkSignature()
-        }
-        wechat = info
-
-        containerReadable = PermissionHelper.canReadContainer(path: containerRoot.path)
-
-        items = WeChatPaths.candidateSubdirs.compactMap { subdir in
-            let source = WeChatPaths.sourceDirectory(containerRoot: containerRoot, subdir: subdir)
-            let state = itemState(at: source)
-            guard state != .missing else { return nil }
-            let size: Int64
-            switch state {
-            case .local:
-                size = DiskProbe.directorySize(at: source)
-            case .migrated:
-                size = DiskProbe.directorySize(at: resolvingSymlink(source))
-            case .brokenSymlink, .missing:
-                size = 0
-            }
-            return ItemStatus(subdir: subdir, source: source, state: state, size: size)
-        }
-
-        if let saved = UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath) {
-            targetBase = URL(fileURLWithPath: saved)
-        }
-        refreshTargetInfo()
+    /// 后台探测结果，一次性回灌到 UI。
+    private struct ProbeResult: Sendable {
+        var wechat: WeChatInfo
+        var containerReadable: Bool
+        var items: [ItemStatus]
+        var targetBasePath: String?
+        var targetFSType: String?
+        var targetFreeSpace: Int64?
     }
 
-    private func resolvingSymlink(_ url: URL) -> URL {
+    func refresh() {
+        isLoading = true
+        let containerRoot = self.containerRoot
+        let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath)
+        // 所有磁盘探测 / 外部进程调用都在后台线程执行，UI 立即渲染"加载中…"。
+        Task.detached { [weak self] in
+            // 只依赖 /Applications/WeChat.app 本体（无需任何权限），绝不依赖容器访问。
+            var info = WeChatDetector.detect()
+            if info.isInstalled {
+                info.signatureValid = WeChatDetector.checkSignature()
+            }
+
+            let readable = PermissionHelper.canReadContainer(path: containerRoot.path)
+
+            let items: [ItemStatus] = WeChatPaths.candidateSubdirs.compactMap { subdir in
+                let source = WeChatPaths.sourceDirectory(containerRoot: containerRoot, subdir: subdir)
+                let state = itemState(at: source)
+                guard state != .missing else { return nil }
+                let size: Int64
+                switch state {
+                case .local:
+                    size = DiskProbe.directorySize(at: source)
+                case .migrated:
+                    size = DiskProbe.directorySize(at: Self.resolvingSymlink(source))
+                case .brokenSymlink, .missing:
+                    size = 0
+                }
+                return ItemStatus(subdir: subdir, source: source, state: state, size: size)
+            }
+
+            var fsType: String? = nil
+            var free: Int64? = nil
+            if let savedTarget {
+                fsType = DiskProbe.volumeFSType(path: savedTarget)
+                free = DiskProbe.freeSpace(path: savedTarget)
+            }
+
+            let result = ProbeResult(
+                wechat: info, containerReadable: readable, items: items,
+                targetBasePath: savedTarget, targetFSType: fsType, targetFreeSpace: free)
+            await self?.applyRefresh(result)
+        }
+    }
+
+    private func applyRefresh(_ result: ProbeResult) {
+        wechat = result.wechat
+        containerReadable = result.containerReadable
+        items = result.items
+        if let path = result.targetBasePath {
+            targetBase = URL(fileURLWithPath: path)
+        }
+        targetFSType = result.targetFSType
+        targetFreeSpace = result.targetFreeSpace
+        isLoading = false
+    }
+
+    private nonisolated static func resolvingSymlink(_ url: URL) -> URL {
         (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path))
             .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? url
     }
@@ -164,10 +207,11 @@ final class AppViewModel: ObservableObject {
         log("开始迁移 \(todo.count) 个目录，共 \(DiskProbe.formatBytes(totalLocalSize)) …")
 
         let total = max(totalLocalSize, 1)
-        let poller = Task { [weak self] in
+        // 轮询也在后台做（目录大小枚举可能很慢），只把结果送回主线程。
+        let poller = Task.detached { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                guard let self, self.isBusy else { return }
+                guard let self, await self.isBusy else { return }
                 let done = todo.reduce(Int64(0)) { sum, item in
                     let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
                     if FileManager.default.fileExists(atPath: t.path) {
@@ -175,7 +219,7 @@ final class AppViewModel: ObservableObject {
                     }
                     return sum + (itemState(at: item.source) == .migrated ? item.size : 0)
                 }
-                self.progress = min(Double(done) / Double(total), 1)
+                await self.setProgress(min(Double(done) / Double(total), 1))
             }
         }
 
@@ -244,9 +288,17 @@ final class AppViewModel: ObservableObject {
         refresh()
     }
 
+    /// osascript 提权弹窗会阻塞，放后台执行。
     func resignWeChat() {
-        if let err = CodeSigner.resignWeChat() {
-            log("⚠️ 重签名未完成：\(err)")
+        Task.detached { [weak self] in
+            let err = CodeSigner.resignWeChat()
+            await self?.resignFinished(error: err)
+        }
+    }
+
+    private func resignFinished(error: String?) {
+        if let error {
+            log("⚠️ 重签名未完成：\(error)")
         } else {
             if let v = wechat.version {
                 UserDefaults.standard.set(v, forKey: DefaultsKey.lastSignedVersion)
@@ -254,6 +306,10 @@ final class AppViewModel: ObservableObject {
             log("✅ 微信重签名完成")
         }
         refresh()
+    }
+
+    private func setProgress(_ value: Double) {
+        progress = value
     }
 
     func log(_ message: String) {
