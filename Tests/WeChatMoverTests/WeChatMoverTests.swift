@@ -142,12 +142,14 @@ private func makeDataDir(root: URL, _ relative: String, fileSizes: [Int] = [100,
         let base = root.appendingPathComponent("external", isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        let backup = WeChatPaths.backupDirectory(for: source)
 
-        // 迁移
+        // 迁移：源改名为 _backup 保留，原位建软链
         try Migrator.migrateItem(source: source, target: target)
         #expect(DiskProbe.isSymlink(source))
         #expect(itemState(at: source) == .migrated)
         #expect(DiskProbe.directorySize(at: target) == 1536)
+        #expect(DiskProbe.directorySize(at: backup) == 1536)   // 备份保留
         // 通过软链能读到原文件
         #expect(FileManager.default.fileExists(atPath: source.appendingPathComponent("file0.bin").path))
 
@@ -156,12 +158,141 @@ private func makeDataDir(root: URL, _ relative: String, fileSizes: [Int] = [100,
             try Migrator.migrateItem(source: source, target: root.appendingPathComponent("other"))
         }
 
-        // 还原
+        // 秒还原：备份改名回原名，外置盘副本保留不动
         try Migrator.restoreItem(source: source, target: target)
         #expect(!DiskProbe.isSymlink(source))
         #expect(itemState(at: source) == .local)
         #expect(DiskProbe.directorySize(at: source) == 1536)
+        #expect(!FileManager.default.fileExists(atPath: backup.path))
+        #expect(FileManager.default.fileExists(atPath: target.path))   // 外置盘副本保留
+    }
+}
+
+// MARK: - _backup 机制
+
+@Test func backupPathMapping() {
+    let source = URL(fileURLWithPath: "/tmp/c/Documents/xwechat_files", isDirectory: true)
+    #expect(WeChatPaths.backupDirectory(for: source).path
+            == "/tmp/c/Documents/xwechat_files_backup")
+}
+
+@Test func restorePrefersLocalBackup() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/app_data", fileSizes: [256])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/app_data")
+        try Migrator.migrateItem(source: source, target: target)
+
+        // 删掉外置盘副本，模拟"外置盘不在手边"：有本地备份照样能秒还原
+        try FileManager.default.removeItem(at: target)
+        try Migrator.restoreItem(source: source, target: target)
+        #expect(itemState(at: source) == .local)
+        #expect(DiskProbe.directorySize(at: source) == 256)
+    }
+}
+
+@Test func restoreFallsBackToExternalCopy() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/app_data", fileSizes: [256])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/app_data")
+        try Migrator.migrateItem(source: source, target: target)
+
+        // 用户已删本地备份 → 走外置盘拷回路径，完成后删外置盘副本
+        try FileManager.default.removeItem(at: WeChatPaths.backupDirectory(for: source))
+        try Migrator.restoreItem(source: source, target: target)
+        #expect(itemState(at: source) == .local)
+        #expect(DiskProbe.directorySize(at: source) == 256)
         #expect(!FileManager.default.fileExists(atPath: target.path))
+    }
+}
+
+@Test func deleteBackupSafetyChecks() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files", fileSizes: [512])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        let backup = WeChatPaths.backupDirectory(for: source)
+
+        // 未迁移（无 _backup）→ 拒绝
+        #expect(throws: MigrationError.self) { try Migrator.deleteBackup(source: source) }
+
+        try Migrator.migrateItem(source: source, target: target)
+        // 迁移完好（软链有效）→ 允许删除并返回释放空间
+        let freed = try Migrator.deleteBackup(source: source)
+        #expect(freed == 512)
+        #expect(!FileManager.default.fileExists(atPath: backup.path))
+        #expect(itemState(at: source) == .migrated)
+
+        // 再删一次 → 备份不存在
+        #expect {
+            try Migrator.deleteBackup(source: source)
+        } throws: { error in
+            guard case MigrationError.backupMissing = error else { return false }
+            return true
+        }
+    }
+}
+
+@Test func deleteBackupRefusesWhenSymlinkBroken() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files", fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: target)
+
+        // 外置盘副本消失 → 软链失效，删除备份必须被拒绝
+        try FileManager.default.removeItem(at: target)
+        #expect {
+            try Migrator.deleteBackup(source: source)
+        } throws: { error in
+            guard case MigrationError.unsafeToDeleteBackup = error else { return false }
+            return true
+        }
+        // 备份仍在
+        #expect(FileManager.default.fileExists(
+            atPath: WeChatPaths.backupDirectory(for: source).path))
+    }
+}
+
+@Test func interruptedResidueDetection() throws {
+    try withTempDir { root in
+        // 源位是普通目录且 _backup 已存在 = 上次迁移中断残留
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files")
+        _ = try makeDataDir(root: root, "container/Documents/xwechat_files_backup", fileSizes: [64])
+        #expect(itemState(at: source) == .interrupted)
+
+        // 迁移必须明确报错而不是静默失败
+        let target = root.appendingPathComponent("external/WeChatData/xwechat_files")
+        #expect {
+            try Migrator.migrateItem(source: source, target: target)
+        } throws: { error in
+            guard case MigrationError.backupAlreadyExists = error else { return false }
+            return true
+        }
+    }
+}
+
+@Test func migratedWithBackupStateDistinction() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files", fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: target)
+
+        // 已迁移且备份仍在
+        #expect(itemState(at: source) == .migrated)
+        #expect(FileManager.default.fileExists(
+            atPath: WeChatPaths.backupDirectory(for: source).path))
+
+        // 删掉备份 → 已迁移无备份，状态仍为 migrated
+        _ = try Migrator.deleteBackup(source: source)
+        #expect(itemState(at: source) == .migrated)
     }
 }
 

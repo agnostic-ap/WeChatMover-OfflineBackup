@@ -46,6 +46,12 @@ struct ContentView: View {
         } message: {
             Text("所选卷格式为 \(vm.targetFSType ?? "未知")。exFAT/NTFS 等格式不支持符号链接与稀疏文件，会导致空间膨胀甚至迁移失败。强烈建议改用 APFS 格式的磁盘。")
         }
+        .alert("删除本地备份", isPresented: $vm.showBackupConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("删除", role: .destructive) { vm.deleteAllBackups() }
+        } message: {
+            Text("将删除 \(vm.backupItems.count) 个备份目录（*_backup），释放约 \(DiskProbe.formatBytes(vm.totalBackupSize))。已逐项确认软链有效后才会删除，但删除后不可恢复。")
+        }
         .alert("操作失败", isPresented: errorPresented) {
             Button("好") { vm.lastError = nil }
         } message: {
@@ -104,6 +110,11 @@ struct ContentView: View {
 
             Button("一键还原") { vm.startRestore() }
                 .disabled(!vm.canRestore)
+
+            if !vm.backupItems.isEmpty {
+                Button("删除备份…") { vm.showBackupConfirm = true }
+                    .disabled(!vm.canDeleteBackups)
+            }
 
             if vm.wechatVersionChanged || vm.wechat.signatureValid == false {
                 Button("重新签名微信") { vm.resignWeChat() }

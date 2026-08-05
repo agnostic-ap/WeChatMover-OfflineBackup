@@ -12,6 +12,7 @@ struct MigrateFlowView: View {
             checkRow("微信已退出", !vm.wechat.isRunning)
             checkRow("官网 DMG 版（非 App Store 版）", !vm.wechat.isAppStoreVersion)
             checkRow("存在待迁移数据目录", !vm.localItems.isEmpty)
+            checkRow("无迁移中断残留（*_backup）", vm.interruptedItems.isEmpty)
             checkRow("目标卷为 APFS", vm.isTargetAPFS)
             checkRow("目标卷空间充足", spaceEnough)
 

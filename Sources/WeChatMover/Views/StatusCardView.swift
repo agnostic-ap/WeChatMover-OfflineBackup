@@ -15,11 +15,15 @@ struct StatusCardView: View {
                     .font(.callout)
                 }
                 row("当前模式", vm.isLoading ? "加载中…" : vm.modeDescription)
-                row("数据总大小", vm.isLoading ? "加载中…" : DiskProbe.formatBytes(vm.totalDataSize))
-                row("内置盘剩余", DiskProbe.formatBytes(DiskProbe.freeSpace(path: NSHomeDirectory()) ?? 0))
+                row("数据总大小", vm.sizesLoaded ? DiskProbe.formatBytes(vm.totalDataSize) : "统计中…")
+                row("内置盘剩余", vm.homeFreeSpace.map(DiskProbe.formatBytes) ?? "加载中…")
                 row("微信来源", vm.isLoading ? "加载中…" : vm.sourceDescription)
                 row("微信版本", vm.isLoading ? "加载中…" : (vm.wechat.version ?? "未安装"))
-                row("签名状态", vm.isLoading ? "加载中…" : signatureText)
+                signatureRow
+                if vm.totalBackupSize > 0 {
+                    row("本地备份", DiskProbe.formatBytes(vm.totalBackupSize)
+                        + (vm.sizesLoaded ? "（删除可释放空间）" : "（统计中…）"))
+                }
                 if let fs = vm.targetFSType {
                     row("目标卷格式", fs + (vm.isTargetAPFS ? " ✅" : " ⚠️ 非 APFS"))
                     row("目标卷剩余", DiskProbe.formatBytes(vm.targetFreeSpace ?? 0))
@@ -40,13 +44,33 @@ struct StatusCardView: View {
         if !vm.brokenItems.isEmpty {
             warningBox("检测到外置盘未连接：软链目标不可达。请先连接硬盘再打开微信，否则微信会新建空数据目录。")
         }
+
+        if !vm.interruptedItems.isEmpty {
+            warningBox(
+                "检测到迁移中断残留：\(vm.interruptedItems.map(\.displayName).joined(separator: "、"))_backup 已存在但源位不是软链。请手工检查（可把 _backup 改名回原名恢复）后再操作。"
+            )
+        }
+    }
+
+    /// 签名校验较慢，不进启动路径：默认"未检测"，点按钮后台检测。
+    private var signatureRow: some View {
+        HStack {
+            Text("签名状态").foregroundStyle(.secondary)
+            Spacer()
+            Text(signatureText)
+            if vm.wechat.signatureValid == nil && vm.wechat.isInstalled && !vm.isLoading {
+                Button("检测") { vm.checkSignatureNow() }
+                    .controlSize(.small)
+            }
+        }
+        .font(.callout)
     }
 
     private var signatureText: String {
         switch vm.wechat.signatureValid {
         case .some(true): return "有效 ✅"
         case .some(false): return "已失效 ⚠️"
-        case .none: return "—"
+        case .none: return "未检测"
         }
     }
 

@@ -4,6 +4,9 @@ enum MigrationError: Error, LocalizedError {
     case sourceMissing(String)
     case sourceIsSymlink(String)
     case targetAlreadyExists(String)
+    case backupAlreadyExists(String)
+    case backupMissing(String)
+    case unsafeToDeleteBackup(String)
     case notMigrated(String)
     case verifyFailed(String)
     case insufficientSpace(need: Int64, free: Int64)
@@ -13,6 +16,11 @@ enum MigrationError: Error, LocalizedError {
         case .sourceMissing(let p): return "源目录不存在：\(p)"
         case .sourceIsSymlink(let p): return "源位置已是符号链接，无需迁移：\(p)"
         case .targetAlreadyExists(let p): return "目标位置已存在数据：\(p)"
+        case .backupAlreadyExists(let p):
+            return "检测到上次迁移中断的残留备份：\(p)。请手工检查（可把 _backup 改名回原名恢复）后重试。"
+        case .backupMissing(let p): return "备份不存在：\(p)"
+        case .unsafeToDeleteBackup(let p):
+            return "软链不存在或目标不可达，删除备份不安全，已拒绝：\(p)"
         case .notMigrated(let p): return "该目录尚未迁移，无法还原：\(p)"
         case .verifyFailed(let p): return "拷贝校验失败：\(p)"
         case .insufficientSpace(let need, let free):
@@ -21,18 +29,29 @@ enum MigrationError: Error, LocalizedError {
     }
 }
 
-/// 迁移/还原核心：拷贝 → 校验 → 删源 → 建软链（失败自动回滚）。
+/// 迁移/还原核心：拷贝 → 校验 → 源改名 _backup → 建软链（失败自动回滚）。
+/// 备份保留在本地，确认迁移完好后由用户手动删除以释放空间。
 /// 全部为同步实现，由调用方放到后台线程执行。
 enum Migrator {
 
+    static func backupURL(for source: URL) -> URL {
+        WeChatPaths.backupDirectory(for: source)
+    }
+
     // MARK: - 迁移
 
-    /// 把 source 迁移到 target（target 必须不存在），完成后 source 变成指向 target 的软链。
+    /// 把 source 迁移到 target（target 必须不存在）。
+    /// 完成后：source 是指向 target 的软链，原数据保留在同级的 `<原名>_backup`。
     static func migrateItem(source: URL, target: URL) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: source.path) else { throw MigrationError.sourceMissing(source.path) }
         guard !DiskProbe.isSymlink(source) else { throw MigrationError.sourceIsSymlink(source.path) }
         guard !fm.fileExists(atPath: target.path) else { throw MigrationError.targetAlreadyExists(target.path) }
+        let backup = backupURL(for: source)
+        // 上次迁移中断的残留：源位不是软链但 _backup 已存在，拒绝继续，避免覆盖备份。
+        guard !fm.fileExists(atPath: backup.path) else {
+            throw MigrationError.backupAlreadyExists(backup.path)
+        }
 
         let expectedSize = DiskProbe.directorySize(at: source)
         try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -51,8 +70,7 @@ enum Migrator {
             throw MigrationError.verifyFailed(target.path)
         }
 
-        // 3. 移走源（先备份再建链，任何一步失败可回滚）
-        let backup = source.appendingPathExtension("mover-backup")
+        // 3. 源改名为 _backup（不删除），再建软链；任一步失败可回滚
         do {
             try fm.moveItem(at: source, to: backup)
             try fm.createSymbolicLink(at: source, withDestinationURL: target)
@@ -63,24 +81,55 @@ enum Migrator {
             throw error
         }
 
-        // 4. 确认软链可达后删备份；软链异常则整体回滚
+        // 4. 确认软链可达；异常则整体回滚
         guard fm.fileExists(atPath: source.path) else {
             try? fm.removeItem(at: source)
             try? fm.moveItem(at: backup, to: source)
             try? fm.removeItem(at: target)
             throw MigrationError.verifyFailed("软链创建后目标不可达")
         }
-        try? fm.removeItem(at: backup)
+    }
+
+    // MARK: - 删除备份
+
+    /// 删除迁移后保留的本地备份，返回释放的字节数。
+    /// 安全检查：仅当源位是软链且目标可达（迁移完好）时才允许删除。
+    static func deleteBackup(source: URL) throws -> Int64 {
+        let fm = FileManager.default
+        let backup = backupURL(for: source)
+        guard fm.fileExists(atPath: backup.path) else { throw MigrationError.backupMissing(backup.path) }
+        guard DiskProbe.isSymlink(source), fm.fileExists(atPath: source.path) else {
+            throw MigrationError.unsafeToDeleteBackup(backup.path)
+        }
+        let size = DiskProbe.directorySize(at: backup)
+        try fm.removeItem(at: backup)
+        return size
     }
 
     // MARK: - 还原
 
-    /// 把已迁移的目录还原：删软链 → 数据拷回原位 → 校验 → 删目标。
+    /// 把已迁移的目录还原：
+    /// - 本地 _backup 仍在 → 删软链 + 备份改名回原名（秒还原，外置盘副本保留不动）；
+    /// - _backup 已删 → 从外置盘拷回 → 校验 → 删目标。
     static func restoreItem(source: URL, target: URL) throws {
         let fm = FileManager.default
         guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
-        guard fm.fileExists(atPath: target.path) else { throw MigrationError.sourceMissing(target.path) }
 
+        let backup = backupURL(for: source)
+        if fm.fileExists(atPath: backup.path) {
+            // 秒还原：仅做改名，失败则恢复软链
+            try fm.removeItem(at: source)
+            do {
+                try fm.moveItem(at: backup, to: source)
+            } catch {
+                try? fm.removeItem(at: source)
+                try? fm.createSymbolicLink(at: source, withDestinationURL: target)
+                throw error
+            }
+            return
+        }
+
+        guard fm.fileExists(atPath: target.path) else { throw MigrationError.sourceMissing(target.path) }
         let expectedSize = DiskProbe.directorySize(at: target)
 
         // 1. 删软链（只删链接，不删数据）

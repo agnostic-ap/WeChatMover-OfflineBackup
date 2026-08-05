@@ -27,4 +27,11 @@ enum WeChatPaths {
     static func sourceDirectory(containerRoot: URL, subdir: String) -> URL {
         containerRoot.appendingPathComponent(subdir, isDirectory: true)
     }
+
+    /// 迁移后保留的本地备份位置：源目录同级、原名加 "_backup" 后缀
+    /// （如 xwechat_files → xwechat_files_backup）。
+    static func backupDirectory(for source: URL) -> URL {
+        source.deletingLastPathComponent()
+            .appendingPathComponent(source.lastPathComponent + "_backup", isDirectory: true)
+    }
 }

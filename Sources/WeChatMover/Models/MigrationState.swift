@@ -7,6 +7,7 @@ enum ItemState: Equatable, Sendable {
     case local          // 源是普通目录，尚未迁移
     case migrated       // 源是有效软链，目标可达
     case brokenSymlink  // 源是软链但目标不可达（外置盘未插入）
+    case interrupted    // 迁移中断残留：源位不是软链但 _backup 已存在
 }
 
 /// 推断某子目录当前状态（纯逻辑，单测用临时目录验证）。
@@ -15,14 +16,20 @@ func itemState(at source: URL) -> ItemState {
     if DiskProbe.isSymlink(source) {
         return fm.fileExists(atPath: source.path) ? .migrated : .brokenSymlink
     }
-    return fm.fileExists(atPath: source.path) ? .local : .missing
+    let backupExists = fm.fileExists(atPath: WeChatPaths.backupDirectory(for: source).path)
+    if fm.fileExists(atPath: source.path) {
+        return backupExists ? .interrupted : .local
+    }
+    return backupExists ? .interrupted : .missing
 }
 
 struct ItemStatus: Identifiable, Sendable {
     let subdir: String
     let source: URL
     let state: ItemState
-    let size: Int64
+    var size: Int64
+    var hasBackup: Bool
+    var backupSize: Int64
     var id: String { subdir }
 
     var displayName: String { (subdir as NSString).lastPathComponent }
@@ -50,6 +57,10 @@ final class AppViewModel: ObservableObject {
     @Published var lastError: String? = nil
     /// 首次/刷新探测进行中：UI 显示"加载中…"占位，避免把默认值误显示成"未安装"。
     @Published var isLoading = false
+    /// 数据大小递归枚举（可能分钟级）是否已完成；未完成时大小字段显示"统计中…"。
+    @Published var sizesLoaded = false
+    @Published var homeFreeSpace: Int64? = nil
+    @Published var showBackupConfirm = false
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -64,11 +75,16 @@ final class AppViewModel: ObservableObject {
     var localItems: [ItemStatus] { items.filter { $0.state == .local } }
     var migratedItems: [ItemStatus] { items.filter { $0.state == .migrated } }
     var brokenItems: [ItemStatus] { items.filter { $0.state == .brokenSymlink } }
+    var interruptedItems: [ItemStatus] { items.filter { $0.state == .interrupted } }
+    var backupItems: [ItemStatus] { items.filter { $0.hasBackup } }
     var totalLocalSize: Int64 { localItems.reduce(0) { $0 + $1.size } }
     var totalDataSize: Int64 { items.reduce(0) { $0 + $1.size } }
+    var totalBackupSize: Int64 { backupItems.reduce(0) { $0 + $1.backupSize } }
 
     var modeDescription: String {
-        if !migratedItems.isEmpty { return "已外置（部分或全部）" }
+        if !migratedItems.isEmpty {
+            return backupItems.isEmpty ? "已外置（部分或全部）" : "已外置（本地备份待清理）"
+        }
         if !brokenItems.isEmpty { return "已外置（硬盘未连接）" }
         return "内置"
     }
@@ -89,79 +105,119 @@ final class AppViewModel: ObservableObject {
     var canMigrate: Bool {
         wechat.isInstalled && !wechat.isAppStoreVersion && !wechat.isRunning
             && !localItems.isEmpty && targetBase != nil && isTargetAPFS
-            && containerReadable && !isBusy
+            && containerReadable && interruptedItems.isEmpty && !isBusy
     }
 
     var canRestore: Bool {
         !migratedItems.isEmpty && !wechat.isRunning && !isBusy
     }
 
-    // MARK: - 刷新
-
-    /// 后台探测结果，一次性回灌到 UI。
-    private struct ProbeResult: Sendable {
-        var wechat: WeChatInfo
-        var containerReadable: Bool
-        var items: [ItemStatus]
-        var targetBasePath: String?
-        var targetFSType: String?
-        var targetFreeSpace: Int64?
+    var canDeleteBackups: Bool {
+        !backupItems.isEmpty && !isBusy
     }
 
+    // MARK: - 刷新（渐进式并行加载）
+
+    /// 每类字段独立后台填充：版本/来源与磁盘余量秒出，数据大小"统计中…"，
+    /// 签名校验不在启动路径（默认"未检测"，由用户手动触发或重签名后自动跑）。
     func refresh() {
         isLoading = true
+        sizesLoaded = false
         let containerRoot = self.containerRoot
         let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath)
-        // 所有磁盘探测 / 外部进程调用都在后台线程执行，UI 立即渲染"加载中…"。
+        if let savedTarget {
+            targetBase = URL(fileURLWithPath: savedTarget)
+        }
+
+        // 1) 微信本体检测：只读 /Applications/WeChat.app 的 Info.plist，毫秒级。
         Task.detached { [weak self] in
-            // 只依赖 /Applications/WeChat.app 本体（无需任何权限），绝不依赖容器访问。
-            var info = WeChatDetector.detect()
-            if info.isInstalled {
-                info.signatureValid = WeChatDetector.checkSignature()
-            }
+            let info = WeChatDetector.detect()
+            await self?.applyWeChat(info)
+        }
 
-            let readable = PermissionHelper.canReadContainer(path: containerRoot.path)
-
-            let items: [ItemStatus] = WeChatPaths.candidateSubdirs.compactMap { subdir in
-                let source = WeChatPaths.sourceDirectory(containerRoot: containerRoot, subdir: subdir)
-                let state = itemState(at: source)
-                guard state != .missing else { return nil }
-                let size: Int64
-                switch state {
-                case .local:
-                    size = DiskProbe.directorySize(at: source)
-                case .migrated:
-                    size = DiskProbe.directorySize(at: Self.resolvingSymlink(source))
-                case .brokenSymlink, .missing:
-                    size = 0
-                }
-                return ItemStatus(subdir: subdir, source: source, state: state, size: size)
-            }
-
+        // 2) 磁盘余量与目标卷格式：statfs，秒出。
+        Task.detached { [weak self] in
+            let homeFree = DiskProbe.freeSpace(path: NSHomeDirectory())
             var fsType: String? = nil
             var free: Int64? = nil
             if let savedTarget {
                 fsType = DiskProbe.volumeFSType(path: savedTarget)
                 free = DiskProbe.freeSpace(path: savedTarget)
             }
+            await self?.applyDiskInfo(homeFree: homeFree, targetFSType: fsType, targetFree: free)
+        }
 
-            let result = ProbeResult(
-                wechat: info, containerReadable: readable, items: items,
-                targetBasePath: savedTarget, targetFSType: fsType, targetFreeSpace: free)
-            await self?.applyRefresh(result)
+        // 3) 容器状态（首次可能触发 TCC 授权弹窗，先出状态不含大小），
+        //    随后才做可能分钟级的目录大小枚举。
+        Task.detached { [weak self] in
+            let readable = PermissionHelper.canReadContainer(path: containerRoot.path)
+            let items: [ItemStatus] = WeChatPaths.candidateSubdirs.compactMap { subdir in
+                let source = WeChatPaths.sourceDirectory(containerRoot: containerRoot, subdir: subdir)
+                let state = itemState(at: source)
+                guard state != .missing else { return nil }
+                let hasBackup = FileManager.default.fileExists(
+                    atPath: WeChatPaths.backupDirectory(for: source).path)
+                return ItemStatus(subdir: subdir, source: source, state: state,
+                                  size: 0, hasBackup: hasBackup, backupSize: 0)
+            }
+            await self?.applyItems(items, readable: readable)
+
+            // 慢速：递归统计大小（含备份大小），完成后单独填充。
+            var sized = items
+            for i in sized.indices {
+                switch sized[i].state {
+                case .local:
+                    sized[i].size = DiskProbe.directorySize(at: sized[i].source)
+                case .migrated:
+                    sized[i].size = DiskProbe.directorySize(at: Self.resolvingSymlink(sized[i].source))
+                case .brokenSymlink, .missing, .interrupted:
+                    sized[i].size = 0
+                }
+                if sized[i].hasBackup {
+                    sized[i].backupSize = DiskProbe.directorySize(
+                        at: WeChatPaths.backupDirectory(for: sized[i].source))
+                }
+            }
+            await self?.applySizes(sized)
         }
     }
 
-    private func applyRefresh(_ result: ProbeResult) {
-        wechat = result.wechat
-        containerReadable = result.containerReadable
-        items = result.items
-        if let path = result.targetBasePath {
-            targetBase = URL(fileURLWithPath: path)
-        }
-        targetFSType = result.targetFSType
-        targetFreeSpace = result.targetFreeSpace
+    private func applyWeChat(_ info: WeChatInfo) {
+        // 保留已检测过的签名状态（refresh 不清空手动检测结果）
+        var info = info
+        info.signatureValid = wechat.signatureValid
+        wechat = info
         isLoading = false
+    }
+
+    private func applyDiskInfo(homeFree: Int64?, targetFSType fs: String?, targetFree: Int64?) {
+        homeFreeSpace = homeFree
+        targetFSType = fs
+        targetFreeSpace = targetFree
+    }
+
+    private func applyItems(_ items: [ItemStatus], readable: Bool) {
+        self.items = items
+        containerReadable = readable
+    }
+
+    private func applySizes(_ sized: [ItemStatus]) {
+        items = sized
+        sizesLoaded = true
+    }
+
+    /// 手动触发签名校验（codesign --verify 要扫整个 App，较慢，后台执行）。
+    func checkSignatureNow() {
+        guard wechat.isInstalled else { return }
+        wechat.signatureValid = nil
+        Task.detached { [weak self] in
+            let ok = WeChatDetector.checkSignature()
+            await self?.applySignature(ok)
+        }
+    }
+
+    private func applySignature(_ ok: Bool) {
+        wechat.signatureValid = ok
     }
 
     private nonisolated static func resolvingSymlink(_ url: URL) -> URL {
@@ -304,6 +360,42 @@ final class AppViewModel: ObservableObject {
                 UserDefaults.standard.set(v, forKey: DefaultsKey.lastSignedVersion)
             }
             log("✅ 微信重签名完成")
+        }
+        refresh()
+        if error == nil { checkSignatureNow() }
+    }
+
+    // MARK: - 删除备份
+
+    /// 一键删除全部本地备份（逐个做安全检查，失败的跳过并记录日志）。
+    func deleteAllBackups() {
+        let todo = backupItems
+        guard !todo.isEmpty else { return }
+        isBusy = true
+        log("开始删除 \(todo.count) 个本地备份 …")
+        Task.detached { [weak self] in
+            var freed: Int64 = 0
+            var failures: [String] = []
+            for item in todo {
+                do {
+                    freed += try Migrator.deleteBackup(source: item.source)
+                    await self?.log("✅ 已删除备份：\(item.displayName)_backup")
+                } catch {
+                    failures.append("\(item.displayName)：\(error.localizedDescription)")
+                }
+            }
+            await self?.deleteBackupsFinished(freed: freed, failures: failures)
+        }
+    }
+
+    private func deleteBackupsFinished(freed: Int64, failures: [String]) {
+        isBusy = false
+        log("备份清理完成，释放空间 \(DiskProbe.formatBytes(freed))")
+        for failure in failures {
+            log("⚠️ 跳过：\(failure)")
+        }
+        if freed == 0, let first = failures.first {
+            lastError = first
         }
         refresh()
     }
