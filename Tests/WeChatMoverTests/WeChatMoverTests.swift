@@ -381,3 +381,20 @@ func detectRealWeChat() {
     #expect(info.version != nil)
     #expect(!info.isAppStoreVersion)  // 本机为官网 DMG 版
 }
+
+// MARK: - 目标选择回调（与 NSOpenPanel 解耦后的纯逻辑）
+
+@MainActor @Test func applyTargetSelectionPersists() throws {
+    try withTempDir { root in
+        let folder = root.appendingPathComponent("ExtFolder", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let vm = AppViewModel()
+        vm.applyTargetSelection(folder)
+        #expect(vm.targetBase?.path == folder.path)
+        #expect(UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath) == folder.path)
+        #expect(vm.targetFSType != nil)                       // 卷格式已探测
+        #expect(vm.targetFreeSpace != nil)                    // 剩余空间已探测
+        #expect(vm.logs.contains { $0.contains("已选择目标位置") })
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
+    }
+}

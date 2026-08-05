@@ -242,7 +242,21 @@ final class AppViewModel: ObservableObject {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // ad-hoc 手工打包的 App 可能处于未激活状态，此时同步 runModal 系统面板
+        // 会因窗口无法前置而假死（彩虹圈）。先激活 App，再用异步 begin 弹窗。
+        NSApp.setActivationPolicy(.regular)
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor [weak self] in
+                self?.applyTargetSelection(url)
+            }
+        }
+    }
+
+    /// 选中目标文件夹后的处理（与弹窗解耦，可单测）。
+    func applyTargetSelection(_ url: URL) {
         targetBase = url
         UserDefaults.standard.set(url.path, forKey: DefaultsKey.targetBasePath)
         refreshTargetInfo()
