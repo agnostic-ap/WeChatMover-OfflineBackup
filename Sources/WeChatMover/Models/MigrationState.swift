@@ -7,7 +7,7 @@ enum ItemState: Equatable, Sendable {
     case local          // 源是普通目录，尚未迁移
     case migrated       // 源是有效软链，目标可达
     case brokenSymlink  // 源是软链但目标不可达（外置盘未插入）
-    case interrupted    // 迁移中断残留：源位不是软链但 _backup 已存在
+    case interrupted    // 迁移中断残留：源位不是软链且存在无标记的 _backup
 }
 
 /// 推断某子目录当前状态（纯逻辑，单测用临时目录验证）。
@@ -16,11 +16,14 @@ func itemState(at source: URL) -> ItemState {
     if DiskProbe.isSymlink(source) {
         return fm.fileExists(atPath: source.path) ? .migrated : .brokenSymlink
     }
-    let backupExists = fm.fileExists(atPath: WeChatPaths.backupDirectory(for: source).path)
+    // 「用外置数据覆盖内置」留下的安全网备份带标记，不算中断残留
+    let backup = WeChatPaths.backupDirectory(for: source)
+    let backupExists = fm.fileExists(atPath: backup.path)
+    let interruptedResidue = backupExists && !Migrator.isOverwriteBackup(backup)
     if fm.fileExists(atPath: source.path) {
-        return backupExists ? .interrupted : .local
+        return interruptedResidue ? .interrupted : .local
     }
-    return backupExists ? .interrupted : .missing
+    return interruptedResidue ? .interrupted : .missing
 }
 
 struct ItemStatus: Identifiable, Sendable {
@@ -189,9 +192,28 @@ final class AppViewModel: ObservableObject {
             && !Self.isExternalDataInUse(items: items, dataRoot: root)
     }
 
-    /// 本地 _backup 仍在且源位是软链（有效或断链均可——恢复流程不依赖外置盘）的项。
+    /// 「用外置数据覆盖内置…」可用条件：外置数据存在 + 无软链指向外置（非迁移中）
+    /// + 有内置数据可覆盖 + 非 busy。与清理按钮共用 isExternalDataInUse 判断。
+    var canOverwriteLocalWithExternal: Bool {
+        guard let root = externalDataURL else { return false }
+        return hasExternalData && !localItems.isEmpty && !isBusy
+            && !Self.isExternalDataInUse(items: items, dataRoot: root)
+    }
+
+    /// 本地 _backup 仍在且可还原的项：源位是软链（有效或断链均可——恢复流程不依赖外置盘），
+    /// 或源位是本地数据且备份带「覆盖安全网」标记（当前内置数据让位给备份）。
     var restorableBackupItems: [ItemStatus] {
-        items.filter { $0.hasBackup && ($0.state == .migrated || $0.state == .brokenSymlink) }
+        items.filter { item in
+            guard item.hasBackup else { return false }
+            switch item.state {
+            case .migrated, .brokenSymlink:
+                return true
+            case .local:
+                return Migrator.isOverwriteBackup(WeChatPaths.backupDirectory(for: item.source))
+            case .missing, .interrupted:
+                return false
+            }
+        }
     }
 
     var canRestoreBackups: Bool {
@@ -390,6 +412,11 @@ final class AppViewModel: ObservableObject {
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
                 title: "正在比对数据新旧…",
                 message: "对比本地备份与外置硬盘上的数据，大目录可能需要几秒。")
+        case .overwriting:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在用外置数据覆盖内置…",
+                message: "覆盖期间请不要打开微信或拔出硬盘；原内置数据已保留为 _backup。")
         case .deletingBackups:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -1062,6 +1089,95 @@ final class AppViewModel: ObservableObject {
             log("❌ 还原内置备份失败：\(error)")
         } else {
             log("已还原内置备份，正在重签名微信…")
+            resignWeChat()
+        }
+        refresh()
+    }
+
+    // MARK: - 用外置数据覆盖内置
+
+    /// 「用外置数据覆盖内置…」入口：先双侧比对（外置目录 vs 当前内置源目录）。
+    func requestOverwriteWithExternal() {
+        guard canOverwriteLocalWithExternal, let base = targetBase else { return }
+        let todo = localItems
+        isBusy = true
+        busyKind = .comparing
+        log("正在比对数据新旧…")
+        Task.detached { [weak self] in
+            let same = Self.externalMatchesLocal(items: todo, base: base)
+            await self?.overwriteComparisonFinished(same: same)
+        }
+    }
+
+    /// 比对各迁移项：外置目录 vs 内置源目录。nil = 有一侧不可读。
+    nonisolated static func externalMatchesLocal(items: [ItemStatus], base: URL) -> Bool? {
+        for item in items {
+            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+            guard let external = Fingerprint.compute(at: target) else { return nil }
+            guard let local = Fingerprint.compute(at: item.source) else { return nil }
+            if external != local { return false }
+        }
+        return true
+    }
+
+    private func overwriteComparisonFinished(same: Bool?) {
+        isBusy = false
+        busyKind = nil
+        switch same {
+        case .some(true):
+            notice = "外置与内置数据一致，无需覆盖。"
+            log("外置与内置数据一致，无需覆盖")
+        case .some(false):
+            activeDialog = .overwriteConfirm
+        case .none:
+            notice = "无法读取外置硬盘数据（可能未连接），无法比对与覆盖。"
+            log("⚠️ 无法读取外置数据进行比对")
+        }
+    }
+
+    /// 覆盖确认框「确认覆盖」：先确保微信已退出。
+    func confirmOverwriteWithExternal() {
+        quitWeChatIfRunning { [weak self] in self?.startOverwriteWithExternal() }
+    }
+
+    func startOverwriteWithExternal() {
+        guard let base = targetBase else { return }
+        // 兜底：确认框打开期间微信又被启动，拒绝覆盖。
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再覆盖。"
+            log("❌ 覆盖被拒绝：微信正在运行")
+            return
+        }
+        let todo = localItems
+        guard !todo.isEmpty else { return }
+        isBusy = true
+        busyKind = .overwriting
+        migrationOutcome = nil
+        log("开始用外置数据覆盖内置 \(todo.count) 个目录 …")
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                for item in todo {
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    try Migrator.overwriteLocalWithExternal(source: item.source, target: target)
+                    await self?.log("✅ 已覆盖：\(item.displayName)（原内置数据已保留为 _backup）")
+                }
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.overwriteFinished(error: failed)
+        }
+    }
+
+    private func overwriteFinished(error: String?) {
+        isBusy = false
+        busyKind = nil
+        if let error {
+            lastError = error
+            log("❌ 覆盖失败：\(error)")
+        } else {
+            log("覆盖完成。原内置数据已保留为 _backup，确认无误后可用「清理备份…」释放空间。正在重签名微信…")
             resignWeChat()
         }
         refresh()

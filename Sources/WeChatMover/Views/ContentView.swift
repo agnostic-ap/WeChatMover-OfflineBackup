@@ -165,6 +165,12 @@ struct ContentView: View {
                 message: Text("将删除外置硬盘上的 \(vm.externalDataURL?.path ?? "")（约 \(DiskProbe.formatBytes(vm.externalDataSize ?? 0))）。删除后不可恢复；本机数据不受影响。"),
                 primaryButton: .destructive(Text("删除")) { vm.cleanExternalData() },
                 secondaryButton: .cancel())
+        case .overwriteConfirm:
+            return Alert(
+                title: Text("用外置数据覆盖内置？"),
+                message: Text("将用外置硬盘上的数据覆盖 Mac 内置盘上的现有数据。覆盖前会先把当前内置数据备份为 _backup（安全网，可事后用「还原内置存储数据到 Mac…」恢复，或确认无误后用「清理备份…」释放空间）；外置硬盘上的数据保留不动。如微信正在运行，将先自动退出。"),
+                primaryButton: .destructive(Text("确认覆盖")) { vm.confirmOverwriteWithExternal() },
+                secondaryButton: .cancel())
         case .error:
             return Alert(
                 title: Text("操作失败"),

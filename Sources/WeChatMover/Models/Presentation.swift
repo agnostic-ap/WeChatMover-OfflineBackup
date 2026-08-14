@@ -12,6 +12,7 @@ enum BusyKind: Equatable {
     case migrating
     case restoring           // 从外置硬盘还原
     case restoringBackups    // 从本地 _backup 还原
+    case overwriting         // 用外置数据覆盖内置
     case comparing           // 还原前比对数据新旧
     case deletingBackups
     case sizingExternal
@@ -101,6 +102,7 @@ enum ActiveDialog: String, Identifiable {
     // 三选项弹窗（confirmationDialog 呈现）：
     case restoreSameChoice    // 外置入口：比对一致，选 内置备份(更快)/仍从外置拷贝
     case restoreNewerChoice   // 内置入口：外置更新，选 改用外置(推荐)/仍用内置备份
+    case overwriteConfirm     // 用外置数据覆盖内置（destructive 确认）
     case existingTarget, cleanExternal
     case error, notice
     var id: String { rawValue }

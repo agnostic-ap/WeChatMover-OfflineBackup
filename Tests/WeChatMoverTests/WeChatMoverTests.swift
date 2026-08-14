@@ -1410,3 +1410,155 @@ private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
         } throws: { guard case MigrationError.sourceMissing = $0 else { return false }; return true }
     }
 }
+
+// MARK: - 用外置数据覆盖内置
+
+@Test func overwriteSuccessKeepsBackupAndExternal() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])                       // 内置旧数据
+        let target = try makeDataDir(root: root, "external/WeChatData/xwechat_files",
+                                     fileSizes: [256, 64])                    // 外置新数据
+        try Migrator.overwriteLocalWithExternal(source: source, target: target)
+
+        let backup = WeChatPaths.backupDirectory(for: source)
+        #expect(DiskProbe.directorySize(at: source) == 320)    // 内容 = 外置
+        #expect(DiskProbe.directorySize(at: backup) == 128)    // _backup = 原内置
+        #expect(Migrator.isOverwriteBackup(backup))            // 带安全网标记
+        #expect(DiskProbe.directorySize(at: target) == 320)    // 外置保留不动
+        #expect(itemState(at: source) == .local)               // 不算中断残留
+    }
+}
+
+@Test func overwriteRefusals() throws {
+    try withTempDir { root in
+        // 源位是软链 → 拒绝
+        let migratedSource = try makeDataDir(root: root, "c/Documents/xwechat_files")
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: migratedSource, target: target)
+        #expect {
+            try Migrator.overwriteLocalWithExternal(source: migratedSource, target: target)
+        } throws: { guard case MigrationError.sourceIsSymlink = $0 else { return false }; return true }
+
+        // _backup 已存在 → 拒绝（不静默销毁旧快照）
+        let source2 = try makeDataDir(root: root, "c2/Documents/app_data", fileSizes: [64])
+        _ = try makeDataDir(root: root, "c2/Documents/app_data_backup", fileSizes: [32])
+        let target2 = try makeDataDir(root: root, "e2/WeChatData/app_data", fileSizes: [64])
+        #expect {
+            try Migrator.overwriteLocalWithExternal(source: source2, target: target2)
+        } throws: { guard case MigrationError.backupAlreadyExists = $0 else { return false }; return true }
+        #expect(DiskProbe.directorySize(at: source2) == 64)    // 源未动
+    }
+}
+
+@Test func overwriteCopyFailureRollsBack() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let target = try makeDataDir(root: root, "external/WeChatData/xwechat_files",
+                                     fileSizes: [256])
+        // 外置目录里放一个不可读文件 → 拷贝中途失败
+        let unreadable = target.appendingPathComponent("secret.bin")
+        try Data(repeating: 1, count: 32).write(to: unreadable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000],
+                                              ofItemAtPath: unreadable.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644],
+                                                       ofItemAtPath: unreadable.path) }
+
+        #expect(throws: (any Error).self) {
+            try Migrator.overwriteLocalWithExternal(source: source, target: target)
+        }
+        // 回滚：源位内容不变，无 _backup 残留
+        #expect(itemState(at: source) == .local)
+        #expect(DiskProbe.directorySize(at: source) == 128)
+        #expect(!FileManager.default.fileExists(
+            atPath: WeChatPaths.backupDirectory(for: source).path))
+    }
+}
+
+@Test func overwriteBackupCanRestoreAndClean() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let target = try makeDataDir(root: root, "external/WeChatData/xwechat_files",
+                                     fileSizes: [256])
+        try Migrator.overwriteLocalWithExternal(source: source, target: target)
+
+        // 清理备份：带标记的覆盖备份允许删除
+        let freed = try Migrator.deleteBackup(source: source)
+        #expect(freed == 128)
+        #expect(itemState(at: source) == .local)
+
+        // 再做一次覆盖，这次还原安全网备份：当前内置数据让位，旧数据回位
+        try Migrator.overwriteLocalWithExternal(source: source, target: target)
+        try Migrator.restoreFromBackup(source: source)
+        #expect(DiskProbe.directorySize(at: source) == 256)    // 回到覆盖前的内置数据
+        #expect(itemState(at: source) == .local)
+    }
+}
+
+// MARK: - 覆盖的比对与可用条件（VM 层）
+
+@MainActor
+private func makeOverwriteFixture(
+    _ root: URL, externalDiffers: Bool
+) throws -> (vm: AppViewModel, source: URL, target: URL) {
+    // 迁移 → 还原内置备份：数据回内置，外置 WeChatData 保留
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+    try Migrator.migrateItem(source: source, target: target)
+    try Migrator.restoreItem(source: source, target: target)
+    if externalDiffers {
+        try Data(repeating: 7, count: 64).write(to: target.appendingPathComponent("new.bin"))
+    }
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .local, size: 128, hasBackup: false, backupSize: 0)]
+    return (vm, source, target)
+}
+
+@MainActor @Test func overwriteAvailabilityAndDecision() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // 一致 → notice「无需覆盖」，不动作
+    let (vmSame, source, target) = try makeOverwriteFixture(root, externalDiffers: false)
+    #expect(vmSame.canOverwriteLocalWithExternal)
+    vmSame.requestOverwriteWithExternal()
+    #expect(await waitUntil { !vmSame.isBusy })
+    #expect(vmSame.notice?.contains("一致") == true)
+    #expect(vmSame.activeDialog == .notice)
+    #expect(itemState(at: source) == .local)
+    #expect(FileManager.default.fileExists(atPath: target.path))
+
+    // 不一致 → 弹覆盖确认框；确认后执行：内容=外置、_backup 生成、外置保留
+    let (vmDiff, source2, target2) = try makeOverwriteFixture(
+        root.appendingPathComponent("case2"), externalDiffers: true)
+    vmDiff.requestOverwriteWithExternal()
+    #expect(await waitUntil { vmDiff.activeDialog == .overwriteConfirm && !vmDiff.isBusy })
+    vmDiff.confirmOverwriteWithExternal()
+    #expect(await waitUntil { !vmDiff.isBusy && vmDiff.activeDialog == .overwriteConfirm })
+    #expect(DiskProbe.directorySize(at: source2) == DiskProbe.directorySize(at: target2))
+    #expect(Migrator.isOverwriteBackup(WeChatPaths.backupDirectory(for: source2)))
+    #expect(vmDiff.lastError == nil)
+
+    // 迁移中（软链指向外置）→ 不可用
+    let vmMigrated = AppViewModel()
+    vmMigrated.targetBase = vmDiff.targetBase
+    vmMigrated.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                                   source: source2, state: .migrated,
+                                   size: 0, hasBackup: false, backupSize: 0)]
+    #expect(!vmMigrated.canOverwriteLocalWithExternal)
+}

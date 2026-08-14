@@ -112,6 +112,12 @@ struct ManageSection: View {
                             .font(.callout)
                             .monospacedDigit()
                         Spacer()
+                        Button("用外置数据覆盖内置…") { vm.requestOverwriteWithExternal() }
+                            .controlSize(.small)
+                            .disabled(!vm.canOverwriteLocalWithExternal)
+                            .help(vm.canOverwriteLocalWithExternal
+                                  ? "用外置硬盘上的数据覆盖 Mac 内置盘现有数据（先备份为 _backup）"
+                                  : "还原数据到 Mac 后可用")
                         Button("清理外置数据…") { vm.requestCleanExternalData() }
                             .controlSize(.small)
                             .disabled(!vm.canCleanExternalData)

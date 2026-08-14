@@ -93,13 +93,20 @@ enum Migrator {
     // MARK: - 删除备份
 
     /// 删除迁移后保留的本地备份，返回释放的字节数。
-    /// 安全检查：仅当源位是软链且目标可达（迁移完好）时才允许删除。
+    /// 安全检查：已迁移项仅当软链目标可达时才允许删除；
+    /// 非软链项仅允许删除带标记的「覆盖安全网」备份（无标记的可能是迁移中断残留）。
     static func deleteBackup(source: URL) throws -> Int64 {
         let fm = FileManager.default
         let backup = backupURL(for: source)
         guard fm.fileExists(atPath: backup.path) else { throw MigrationError.backupMissing(backup.path) }
-        guard DiskProbe.isSymlink(source), fm.fileExists(atPath: source.path) else {
-            throw MigrationError.unsafeToDeleteBackup(backup.path)
+        if DiskProbe.isSymlink(source) {
+            guard fm.fileExists(atPath: source.path) else {
+                throw MigrationError.unsafeToDeleteBackup(backup.path)
+            }
+        } else {
+            guard isOverwriteBackup(backup) else {
+                throw MigrationError.unsafeToDeleteBackup(backup.path)
+            }
         }
         let size = DiskProbe.directorySize(at: backup)
         try fm.removeItem(at: backup)
@@ -154,6 +161,57 @@ enum Migrator {
         try? fm.removeItem(at: target)
     }
 
+    // MARK: - 用外置数据覆盖内置
+
+    /// 用外置数据覆盖内置：当前内置数据先改名 _backup（安全网），再拷入外置数据并校验，
+    /// 失败整体回滚（_backup 改回原名）。源位是软链或 _backup 已存在时拒绝。
+    /// 外置数据全程不动。
+    static func overwriteLocalWithExternal(source: URL, target: URL) throws {
+        let fm = FileManager.default
+        // 双保险：可用条件在 UI 层已挡，这里再拒绝
+        guard !DiskProbe.isSymlink(source) else { throw MigrationError.sourceIsSymlink(source.path) }
+        let backup = backupURL(for: source)
+        // 不静默销毁旧快照：提示先清理/还原已有备份
+        guard !fm.fileExists(atPath: backup.path) else {
+            throw MigrationError.backupAlreadyExists(backup.path)
+        }
+        guard fm.fileExists(atPath: target.path) else { throw MigrationError.sourceMissing(target.path) }
+        guard fm.fileExists(atPath: source.path) else { throw MigrationError.sourceMissing(source.path) }
+        let expectedSize = DiskProbe.directorySize(at: target)
+
+        // 1. 当前内置数据改名 _backup（安全网）
+        try fm.moveItem(at: source, to: backup)
+
+        // 2. 拷入外置数据；失败回滚
+        do {
+            try fm.copyItem(at: target, to: source)
+        } catch {
+            try? fm.removeItem(at: source)
+            try? fm.moveItem(at: backup, to: source)
+            throw error
+        }
+
+        // 3. 校验；失败回滚
+        guard DiskProbe.directorySize(at: source) == expectedSize else {
+            try? fm.removeItem(at: source)
+            try? fm.moveItem(at: backup, to: source)
+            throw MigrationError.verifyFailed(source.path)
+        }
+
+        // 4. 给安全网备份打标记（区别于"迁移中断残留"，后续可正常还原/清理）
+        fm.createFile(atPath: backup.appendingPathComponent(Self.overwriteBackupMarker).path,
+                      contents: Data())
+    }
+
+    /// 覆盖安全网备份内的标记文件名（隐藏文件，指纹/大小统计均跳过）。
+    static let overwriteBackupMarker = ".wcm_overwrite_backup"
+
+    /// 该 _backup 是否为「用外置数据覆盖内置」留下的安全网备份。
+    static func isOverwriteBackup(_ backup: URL) -> Bool {
+        FileManager.default.fileExists(
+            atPath: backup.appendingPathComponent(overwriteBackupMarker).path)
+    }
+
     // MARK: - 强制从外置盘还原
 
     /// 强制从外置盘还原（外置数据比本地备份新时）：拷回 → 校验 → 删外置副本，
@@ -193,11 +251,38 @@ enum Migrator {
 
     /// 仅用本地 _backup 还原：删软链 + 备份改名回原名。
     /// 完全不访问外置盘（不插盘也能用）；备份不存在时拒绝（改用完整还原）。
+    /// 带标记的「覆盖安全网」备份（源位不是软链）：当前内置数据让位给备份。
     static func restoreFromBackup(source: URL) throws {
         let fm = FileManager.default
-        guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
         let backup = backupURL(for: source)
-        guard fm.fileExists(atPath: backup.path) else { throw MigrationError.backupMissing(backup.path) }
+        let backupExists = fm.fileExists(atPath: backup.path)
+
+        guard DiskProbe.isSymlink(source) else {
+            // 非软链：无备份按未迁移拒绝（旧语义）；
+            // 仅带标记的「覆盖安全网」备份可还原：当前内置数据让位给备份。
+            guard backupExists, isOverwriteBackup(backup) else {
+                throw MigrationError.notMigrated(source.path)
+            }
+            guard fm.fileExists(atPath: source.path) else {
+                try fm.moveItem(at: backup, to: source)
+                return
+            }
+            // 当前内置数据（外置拷入的）暂存，备份回位后删除；失败回滚
+            let staging = source.deletingLastPathComponent()
+                .appendingPathComponent(source.lastPathComponent + "_restoring", isDirectory: true)
+            try? fm.removeItem(at: staging)
+            try fm.moveItem(at: source, to: staging)
+            do {
+                try fm.moveItem(at: backup, to: source)
+            } catch {
+                try? fm.moveItem(at: staging, to: source)
+                throw error
+            }
+            try? fm.removeItem(at: staging)
+            return
+        }
+
+        guard backupExists else { throw MigrationError.backupMissing(backup.path) }
         // 先记下软链目标用于失败回滚（只读，不访问目标本身）
         let dest = try? fm.destinationOfSymbolicLink(atPath: source.path)
         try fm.removeItem(at: source)
