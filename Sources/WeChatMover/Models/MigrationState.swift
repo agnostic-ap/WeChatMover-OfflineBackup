@@ -90,6 +90,8 @@ final class AppViewModel: ObservableObject {
     @Published var busyKind: BusyKind? = nil
     /// 最近一次迁移的结果（驱动成功/失败横幅，「完成」或新操作清除）。
     @Published var migrationOutcome: MigrationOutcome? = nil
+    /// 还原确认框附加说明（如"外置数据与本地备份一致，可直接使用本地备份"）。
+    @Published var restoreNote: String? = nil
 
     // 兼容既有测试的只读映射（弹窗语义不变）。
     var showExistingTargetConfirm: Bool { activeDialog == .existingTarget }
@@ -380,6 +382,11 @@ final class AppViewModel: ObservableObject {
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
                 title: "正在还原内置备份到 Mac…",
                 message: "还原期间请不要打开微信。")
+        case .comparing:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在比对数据新旧…",
+                message: "对比本地备份与外置硬盘上的数据，大目录可能需要几秒。")
         case .deletingBackups:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -662,9 +669,75 @@ final class AppViewModel: ObservableObject {
         quitWeChatIfRunning { [weak self] in self?.startMigration() }
     }
 
+    /// 「还原外置存储数据到 Mac…」入口：有本地备份时先做新旧判定，再决定弹哪个确认框。
+    func requestRestore() {
+        guard canRestore else { return }
+        restoreNote = nil
+        let withBackup = migratedItems.filter { $0.hasBackup }
+        guard !withBackup.isEmpty, let base = targetBase else {
+            // 无本地备份：维持现状，直接从外置还原
+            activeDialog = .restoreConfirm
+            return
+        }
+        isBusy = true
+        busyKind = .comparing
+        log("正在比对数据新旧…")
+        Task.detached { [weak self] in
+            let same = Self.externalMatchesBackup(items: withBackup, base: base)
+            await self?.restoreComparisonFinished(same: same)
+        }
+    }
+
+    /// 新旧判定：本地备份与外置数据是否一致。
+    /// 有 manifest 只重算外置侧（快）；无 manifest（旧迁移）双侧各算一次。
+    /// 返回 nil = 无法判定（外置不可读等），调用方回退现有流程。
+    nonisolated static func externalMatchesBackup(items: [ItemStatus], base: URL) -> Bool? {
+        let manifest = Fingerprint.readManifest(base: base)
+        for item in items {
+            let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+            guard let external = Fingerprint.compute(at: target) else { return nil }
+            let reference: Fingerprint.Value
+            if let fromManifest = manifest?.fingerprint(for: item.subdir) {
+                reference = fromManifest
+            } else {
+                let backup = WeChatPaths.backupDirectory(for: item.source)
+                guard let fp = Fingerprint.compute(at: backup) else { return nil }
+                reference = fp
+            }
+            if external != reference { return false }
+        }
+        return true
+    }
+
+    private func restoreComparisonFinished(same: Bool?) {
+        isBusy = false
+        busyKind = nil
+        switch same {
+        case .some(true):
+            // 一致：不弹新旧提示，直接走本地备份还原（快），确认框注明原因
+            restoreNote = "外置数据与本地备份一致，可直接使用本地备份还原（更快）。"
+            log("外置数据与本地备份一致，直接使用本地备份还原")
+            activeDialog = .restoreConfirm
+        case .some(false):
+            restoreNote = nil
+            log("⚠️ 外置数据与本地备份不一致（迁移后可能有新写入）")
+            activeDialog = .restoreConflict
+        case .none:
+            // 比对失败（外置盘断开等）：回退现有流程
+            restoreNote = nil
+            log("⚠️ 无法读取外置数据进行比对，按原流程继续")
+            activeDialog = .restoreConfirm
+        }
+    }
+
     /// 还原外置数据确认框「确认还原」：与迁移一致，运行中先退出微信再还原。
     func confirmRestore() {
         quitWeChatIfRunning { [weak self] in self?.startRestore() }
+    }
+
+    /// 新旧不一致时「使用外置数据还原」：忽略本地备份，强制从外置盘拷回。
+    func confirmRestoreFromExternal() {
+        quitWeChatIfRunning { [weak self] in self?.startRestoreFromExternal() }
     }
 
     /// 还原内置备份确认框「确认还原」：同样先确保微信已退出。
@@ -734,15 +807,34 @@ final class AppViewModel: ObservableObject {
 
         Task.detached { [weak self] in
             var failed: (any Error)? = nil
+            var manifestItems: [MigrationManifest.Item] = []
             do {
                 try Migrator.checkSpace(totalBytes: total, targetPath: base.path)
                 for item in todo {
                     let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
                     try Migrator.migrateItem(source: item.source, target: target)
+                    // 迁移时刻的指纹快照（stat 遍历，供还原时新旧判定）
+                    if let fp = Fingerprint.compute(at: target) {
+                        manifestItems.append(.init(subdir: item.subdir, fingerprint: fp))
+                    }
                     await self?.log("✅ 已迁移：\(item.displayName)")
                 }
             } catch {
                 failed = error
+            }
+            if failed == nil {
+                // 全部成功后写清单；失败只记日志，不影响迁移结果
+                do {
+                    let version = Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+                    try Fingerprint.writeManifest(
+                        MigrationManifest(toolVersion: version, migratedAt: Date(),
+                                          items: manifestItems),
+                        base: base)
+                    await self?.log("已写入迁移清单（manifest.json）")
+                } catch {
+                    await self?.log("⚠️ 写入迁移清单失败（不影响迁移）：\(error.localizedDescription)")
+                }
             }
             await self?.migrationFinished(error: failed)
             poller.cancel()
@@ -850,6 +942,37 @@ final class AppViewModel: ObservableObject {
             resignWeChat()
         }
         refresh()
+    }
+
+    /// 强制从外置盘还原（新旧判定不一致、用户选「使用外置数据还原」）：
+    /// 忽略本地备份，逐项从外置拷回，过期 _backup 随各项一并清除。
+    func startRestoreFromExternal() {
+        guard let base = targetBase else { return }
+        // 兜底：确认框打开期间微信又被启动，拒绝还原。
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再还原。"
+            log("❌ 还原被拒绝：微信正在运行")
+            return
+        }
+        let todo = migratedItems
+        isBusy = true
+        busyKind = .restoring
+        migrationOutcome = nil
+        log("开始从外置硬盘还原 \(todo.count) 个目录（忽略本地备份）…")
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                for item in todo {
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    try Migrator.restoreItemFromExternal(source: item.source, target: target)
+                    await self?.log("✅ 已从外置还原：\(item.displayName)")
+                }
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.restoreFinished(error: failed)
+        }
     }
 
     // MARK: - 还原内置备份

@@ -42,7 +42,7 @@ struct ActionSection: View {
                     .disabled(!vm.canMigrate)
                     .keyboardShortcut(.defaultAction)
             case .restore:
-                Button("还原外置存储数据到 Mac…") { vm.activeDialog = .restoreConfirm }
+                Button("还原外置存储数据到 Mac…") { vm.requestRestore() }
                     .buttonStyle(.borderedProminent)
                     .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
@@ -77,7 +77,7 @@ struct ManageSection: View {
                         Text("部分数据已外置，可从外置硬盘还原回 Mac")
                             .font(.callout)
                         Spacer()
-                        Button("还原外置存储数据到 Mac…") { vm.activeDialog = .restoreConfirm }
+                        Button("还原外置存储数据到 Mac…") { vm.requestRestore() }
                             .controlSize(.small)
                             .disabled(!vm.canRestore)
                     }

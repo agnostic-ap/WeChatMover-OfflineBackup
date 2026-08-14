@@ -154,6 +154,41 @@ enum Migrator {
         try? fm.removeItem(at: target)
     }
 
+    // MARK: - 强制从外置盘还原
+
+    /// 强制从外置盘还原（外置数据比本地备份新时）：拷回 → 校验 → 删外置副本，
+    /// 并删除已被外置数据取代的本地 _backup（留着会变成"中断残留"状态）。
+    static func restoreItemFromExternal(source: URL, target: URL) throws {
+        let fm = FileManager.default
+        guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
+        guard fm.fileExists(atPath: target.path) else { throw MigrationError.sourceMissing(target.path) }
+        let backup = backupURL(for: source)
+        let expectedSize = DiskProbe.directorySize(at: target)
+
+        // 1. 删软链（只删链接，不删数据）
+        try fm.removeItem(at: source)
+
+        // 2. 拷回原位
+        do {
+            try fm.copyItem(at: target, to: source)
+        } catch {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: target)
+            throw error
+        }
+
+        // 3. 校验后删外置副本与过期备份
+        guard DiskProbe.directorySize(at: source) == expectedSize else {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: target)
+            throw MigrationError.verifyFailed(source.path)
+        }
+        try? fm.removeItem(at: target)
+        if fm.fileExists(atPath: backup.path) {
+            try? fm.removeItem(at: backup)
+        }
+    }
+
     // MARK: - 还原内置备份
 
     /// 仅用本地 _backup 还原：删软链 + 备份改名回原名。

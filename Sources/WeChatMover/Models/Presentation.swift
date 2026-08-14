@@ -12,6 +12,7 @@ enum BusyKind: Equatable {
     case migrating
     case restoring           // 从外置硬盘还原
     case restoringBackups    // 从本地 _backup 还原
+    case comparing           // 还原前比对数据新旧
     case deletingBackups
     case sizingExternal
     case cleaningExternal
@@ -97,6 +98,7 @@ struct StatusCardModel: Identifiable, Equatable {
 
 enum ActiveDialog: String, Identifiable {
     case migrateConfirm, restoreConfirm, backupRestoreConfirm, backupConfirm
+    case restoreConflict   // 外置数据与本地备份不一致（三选项，用 confirmationDialog 呈现）
     case existingTarget, cleanExternal
     case error, notice
     var id: String { rawValue }

@@ -1149,3 +1149,223 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     vm.items = []
     #expect(vm.primaryAction == .none)
 }
+
+// MARK: - 目录指纹
+
+@Test func fingerprintDeterministicAndOrderIndependent() throws {
+    try withTempDir { root in
+        let a = root.appendingPathComponent("a", isDirectory: true)
+        _ = try makeDataDir(root: root, "a/sub", fileSizes: [100, 200])
+        try Data(repeating: 9, count: 50).write(to: a.appendingPathComponent("top.bin"))
+        // b 用 copyItem 逐个复制（保留 mtime），但创建顺序与 a 不同
+        let b = root.appendingPathComponent("b")
+        try FileManager.default.createDirectory(
+            at: b.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: a.appendingPathComponent("top.bin"), to: b.appendingPathComponent("top.bin"))
+        for i in [1, 0] {   // 反序
+            try FileManager.default.copyItem(
+                at: a.appendingPathComponent("sub/file\(i).bin"),
+                to: b.appendingPathComponent("sub/file\(i).bin"))
+        }
+        let fa = Fingerprint.compute(at: a)
+        let fb = Fingerprint.compute(at: b)
+        #expect(fa != nil && fa == fb)                       // 顺序无关、确定性
+        #expect(Fingerprint.compute(at: a) == fa)            // 重算一致
+        #expect(fa?.fileCount == 3 && fa?.totalBytes == 350)
+    }
+}
+
+@Test func fingerprintDetectsChanges() throws {
+    try withTempDir { root in
+        let dir = try makeDataDir(root: root, "data", fileSizes: [100, 200])
+        let base = Fingerprint.compute(at: dir)
+
+        // 新增文件
+        try Data(repeating: 1, count: 10).write(to: dir.appendingPathComponent("new.bin"))
+        #expect(Fingerprint.compute(at: dir) != base)
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("new.bin"))
+        #expect(Fingerprint.compute(at: dir) == base)
+
+        // 改名（来回改回后指纹应复原：改名不改 mtime）
+        try FileManager.default.moveItem(
+            at: dir.appendingPathComponent("file0.bin"),
+            to: dir.appendingPathComponent("renamed.bin"))
+        #expect(Fingerprint.compute(at: dir) != base)
+        try FileManager.default.moveItem(
+            at: dir.appendingPathComponent("renamed.bin"),
+            to: dir.appendingPathComponent("file0.bin"))
+        #expect(Fingerprint.compute(at: dir) == base)
+
+        // 同尺寸改写 → mtime 变化可检出
+        let file = dir.appendingPathComponent("file0.bin")
+        try Data(repeating: 42, count: 100).write(to: file)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)],
+            ofItemAtPath: file.path)
+        #expect(Fingerprint.compute(at: dir) != base)
+
+        // 删除文件
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("file1.bin"))
+        #expect(Fingerprint.compute(at: dir) != base)
+
+        // 目录不存在 → nil
+        #expect(Fingerprint.compute(at: root.appendingPathComponent("nope")) == nil)
+    }
+}
+
+@Test func copyPreservesFingerprint() throws {
+    try withTempDir { root in
+        // 迁移依赖此前提：FileManager.copyItem 保留 mtime，拷贝副本指纹一致
+        let dir = try makeDataDir(root: root, "origin/deep", fileSizes: [128, 256])
+        let copy = root.appendingPathComponent("copy")
+        try FileManager.default.copyItem(at: dir, to: copy)
+        #expect(Fingerprint.compute(at: copy) == Fingerprint.compute(at: dir))
+    }
+}
+
+// MARK: - 迁移清单读写
+
+@Test func manifestRoundtrip() throws {
+    try withTempDir { root in
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        let target = try makeDataDir(root: root, "external/WeChatData/xwechat_files",
+                                     fileSizes: [128])
+        let fp = Fingerprint.compute(at: target)!
+        let manifest = MigrationManifest(
+            toolVersion: "1.0.0", migratedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            items: [.init(subdir: "Documents/xwechat_files", fingerprint: fp)])
+        try Fingerprint.writeManifest(manifest, base: base)
+        let read = Fingerprint.readManifest(base: base)
+        #expect(read == manifest)
+        #expect(read?.fingerprint(for: "Documents/xwechat_files") == fp)
+        #expect(read?.fingerprint(for: "Documents/nope") == nil)
+        // 无清单 → nil
+        #expect(Fingerprint.readManifest(
+            base: root.appendingPathComponent("empty")) == nil)
+    }
+}
+
+// MARK: - 新旧判定（manifest 单侧快路径 / 无 manifest 双侧兜底）
+
+@MainActor
+private func makeRestoreFixture(_ root: URL) throws -> (vm: AppViewModel, source: URL, base: URL, target: URL) {
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128, 256])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+    try Migrator.migrateItem(source: source, target: target)
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .migrated, size: 384, hasBackup: true, backupSize: 384)]
+    return (vm, source, base, target)
+}
+
+private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
+    try Fingerprint.writeManifest(
+        MigrationManifest(toolVersion: "test", migratedAt: Date(),
+                          items: [.init(subdir: subdir, fingerprint: Fingerprint.compute(at: target)!)]),
+        base: base)
+}
+
+@MainActor @Test func restoreDecisionSameWithManifest() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (vm, _, base, target) = try makeRestoreFixture(root)
+    try writeManifestFor(base: base, subdir: "Documents/xwechat_files", target: target)
+
+    vm.requestRestore()
+    #expect(await waitUntil { vm.activeDialog == .restoreConfirm && !vm.isBusy })
+    #expect(vm.restoreNote?.contains("一致") == true)   // 注明直接用本地备份
+}
+
+@MainActor @Test func restoreDecisionSameWithoutManifest() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (vm, _, _, _) = try makeRestoreFixture(root)   // 不写 manifest → 双侧兜底
+
+    vm.requestRestore()
+    #expect(await waitUntil { vm.activeDialog == .restoreConfirm && !vm.isBusy })
+    #expect(vm.restoreNote?.contains("一致") == true)
+}
+
+@MainActor @Test func restoreDecisionDiffersShowsConflict() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (vm, _, base, target) = try makeRestoreFixture(root)
+    try writeManifestFor(base: base, subdir: "Documents/xwechat_files", target: target)
+    // 迁移后外置盘有新写入
+    try Data(repeating: 7, count: 64).write(to: target.appendingPathComponent("new-chat.bin"))
+
+    vm.requestRestore()
+    #expect(await waitUntil { vm.activeDialog == .restoreConflict && !vm.isBusy })
+    #expect(vm.restoreNote == nil)
+}
+
+@MainActor @Test func restoreDecisionNoBackupSkipsCompare() {
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/c/x"),
+                           state: .migrated, size: 100, hasBackup: false, backupSize: 0)]
+    vm.requestRestore()
+    // 无本地备份 → 不比对，直接弹常规确认框
+    #expect(vm.activeDialog == .restoreConfirm)
+    #expect(vm.busyKind == nil)
+}
+
+// MARK: - 强制从外置还原
+
+@Test func restoreItemFromExternalPath() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: target)
+        let backup = WeChatPaths.backupDirectory(for: source)
+
+        // 外置有新数据
+        try Data(repeating: 7, count: 64).write(to: target.appendingPathComponent("new.bin"))
+        try Migrator.restoreItemFromExternal(source: source, target: target)
+        #expect(itemState(at: source) == .local)
+        #expect(DiskProbe.directorySize(at: source) == 192)   // 含新数据
+        #expect(!FileManager.default.fileExists(atPath: target.path))  // 外置副本已删
+        #expect(!FileManager.default.fileExists(atPath: backup.path))  // 过期备份已删
+    }
+}
+
+@Test func restoreItemFromExternalRefusals() throws {
+    try withTempDir { root in
+        // 非软链 → notMigrated
+        let local = try makeDataDir(root: root, "c/Documents/app_data")
+        #expect {
+            try Migrator.restoreItemFromExternal(
+                source: local, target: root.appendingPathComponent("t"))
+        } throws: { guard case MigrationError.notMigrated = $0 else { return false }; return true }
+
+        // 软链但外置目标不存在 → sourceMissing
+        let source = root.appendingPathComponent("c2/Documents/xwechat_files")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: source, withDestinationURL: root.appendingPathComponent("gone"))
+        #expect {
+            try Migrator.restoreItemFromExternal(
+                source: source, target: root.appendingPathComponent("gone"))
+        } throws: { guard case MigrationError.sourceMissing = $0 else { return false }; return true }
+    }
+}
