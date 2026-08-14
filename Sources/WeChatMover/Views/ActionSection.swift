@@ -12,18 +12,11 @@ struct ActionSection: View {
         }
     }
 
-    /// 迁移进度面板：真实字节进度，不靠日志。
+    /// 迁移进度面板：只保留步骤与说明文字；进度条与百分比以顶部横幅为准（不重复展示）。
     private var progressPanel: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
             Text("正在复制微信数据")
                 .font(.headline)
-            HStack {
-                ProgressView(value: vm.progress)
-                Text("\(Int((vm.progress * 100).rounded()))%")
-                    .font(.callout).monospacedDigit()
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityValue("\(Int((vm.progress * 100).rounded()))%")
             Text("迁移期间请不要退出微信或拔出硬盘")
                 .font(.caption)
                 .foregroundStyle(.secondary)
