@@ -398,3 +398,139 @@ func detectRealWeChat() {
         UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
     }
 }
+
+// MARK: - osascript 提权结果解析（纯逻辑）
+
+@Test func parseResignResultSuccess() {
+    #expect(CodeSigner.parseResult(status: 0, stderr: "") == .success)
+    // 退出码 0 即成功，即使 stderr 有杂散输出
+    #expect(CodeSigner.parseResult(status: 0, stderr: "noise") == .success)
+}
+
+@Test func parseResignResultCancelled() {
+    // osascript 提权弹窗「用户取消」的真实输出
+    let real = "31:76: execution error: User canceled. (-128)\n"
+    #expect(CodeSigner.parseResult(status: 1, stderr: real) == .cancelled)
+    #expect(CodeSigner.parseResult(status: 1, stderr: "User canceled") == .cancelled)
+    #expect(CodeSigner.parseResult(status: 1, stderr: "(-128)") == .cancelled)
+}
+
+@Test func parseResignResultFailure() {
+    #expect(CodeSigner.parseResult(status: 1, stderr: "some error\n")
+            == .failed("some error"))
+    #expect(CodeSigner.parseResult(status: 3, stderr: "  \n") == .failed("退出码 3"))
+    // 取消不算失败
+    if case .failed = CodeSigner.parseResult(status: 1, stderr: "User canceled. (-128)") {
+        Issue.record("用户取消不应解析为失败")
+    }
+}
+
+// MARK: - 进程异步执行（用 /bin/sh fixture，不触碰提权路径）
+
+@Test func runProcessSuccess() async {
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "exit 0"]
+        ) { cont.resume(returning: $0) }
+    }
+    #expect(result == .success)
+}
+
+@Test func runProcessCancelledParsing() async {
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "echo 'User canceled. (-128)' >&2; exit 1"]
+        ) { cont.resume(returning: $0) }
+    }
+    #expect(result == .cancelled)
+}
+
+@Test func runProcessFailure() async {
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "echo boom >&2; exit 2"]
+        ) { cont.resume(returning: $0) }
+    }
+    #expect(result == .failed("boom"))
+}
+
+/// stderr 输出超过管道缓冲（64KB）时进程不应假死：readabilityHandler 持续排空。
+@Test func runProcessLargeStderrNoDeadlock() async {
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "i=0; while [ $i -lt 20000 ]; do echo line$i >&2; i=$((i+1)); done; exit 7"]
+        ) { cont.resume(returning: $0) }
+    }
+    if case .failed(let msg) = result {
+        #expect(msg.contains("line19999"))   // stderr 完整读完
+    } else {
+        Issue.record("期望 failed，实际 \(result)")
+    }
+}
+
+// MARK: - 退出微信流程（注入假 closure，不触碰真实微信）
+
+private final class QuitFixture: @unchecked Sendable {
+    var running = true
+    var gracefulCalls = 0
+    var forceCalls = 0
+}
+
+@Test func ensureQuitSkipsWhenNotRunning() async {
+    let f = QuitFixture()
+    f.running = false
+    let ok = await WeChatQuitter.ensureQuit(
+        isRunning: { f.running },
+        graceful: { f.gracefulCalls += 1 },
+        force: { f.forceCalls += 1 })
+    #expect(ok)
+    #expect(f.gracefulCalls == 0)
+    #expect(f.forceCalls == 0)
+}
+
+@Test func ensureQuitGracefulSuccess() async {
+    let f = QuitFixture()
+    let ok = await WeChatQuitter.ensureQuit(
+        graceTimeout: 2, forceTimeout: 1,
+        isRunning: { f.running },
+        graceful: { f.gracefulCalls += 1; f.running = false },   // 优雅退出成功
+        force: { f.forceCalls += 1 })
+    #expect(ok)
+    #expect(f.gracefulCalls == 1)
+    #expect(f.forceCalls == 0)                                    // 不应强杀
+}
+
+@Test func ensureQuitForceKillAfterGraceTimeout() async {
+    let f = QuitFixture()
+    let ok = await WeChatQuitter.ensureQuit(
+        graceTimeout: 0.4, forceTimeout: 2,
+        isRunning: { f.running },
+        graceful: { f.gracefulCalls += 1 },                       // 优雅退出无效
+        force: { f.forceCalls += 1; f.running = false })          // 强杀生效
+    #expect(ok)
+    #expect(f.gracefulCalls == 1)
+    #expect(f.forceCalls == 1)
+}
+
+@Test func ensureQuitFailsWhenProcessStubborn() async {
+    let f = QuitFixture()
+    let ok = await WeChatQuitter.ensureQuit(
+        graceTimeout: 0.3, forceTimeout: 0.3,
+        isRunning: { f.running },                                 // 始终不退
+        graceful: { f.gracefulCalls += 1 },
+        force: { f.forceCalls += 1 })
+    #expect(!ok)
+    #expect(f.gracefulCalls == 1)
+    #expect(f.forceCalls == 1)
+}
+
+@Test func waitForExitTiming() async {
+    let timedOut = await WeChatQuitter.waitForExit(timeout: 0.3, pollInterval: 0.1) { true }
+    #expect(!timedOut)
+    let exited = await WeChatQuitter.waitForExit(timeout: 1, pollInterval: 0.1) { false }
+    #expect(exited)
+}

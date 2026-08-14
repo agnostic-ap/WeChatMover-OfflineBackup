@@ -61,6 +61,11 @@ final class AppViewModel: ObservableObject {
     @Published var sizesLoaded = false
     @Published var homeFreeSpace: Int64? = nil
     @Published var showBackupConfirm = false
+    @Published var showQuitWeChatConfirm = false
+    /// 正在等待微信退出（优雅退出 → 必要时强杀）。
+    @Published var isQuittingWeChat = false
+    /// 正在等待 osascript 提权密码框的结果（重签名进行中）。
+    @Published var isResigning = false
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -101,11 +106,12 @@ final class AppViewModel: ObservableObject {
         return current != last
     }
 
-    /// 迁移按钮是否可用。
+    /// 迁移按钮是否可用。微信正在运行不再禁用按钮：
+    /// 点击后由 requestMigration() 弹确认框引导退出微信。
     var canMigrate: Bool {
-        wechat.isInstalled && !wechat.isAppStoreVersion && !wechat.isRunning
+        wechat.isInstalled && !wechat.isAppStoreVersion
             && !localItems.isEmpty && targetBase != nil && isTargetAPFS
-            && containerReadable && interruptedItems.isEmpty && !isBusy
+            && containerReadable && interruptedItems.isEmpty && !isBusy && !isQuittingWeChat
     }
 
     var canRestore: Bool {
@@ -235,6 +241,14 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - 目标选择
 
+    /// 弹系统级对话框前的统一动作：激活 App。
+    /// ad-hoc 手工打包的 App 可能处于未激活状态，此时系统面板/密码框无法前置而假死。
+    /// 所有系统对话框入口（NSOpenPanel、osascript 提权/自动化弹窗）都必须先调它。
+    func activateApp() {
+        NSApp.setActivationPolicy(.regular)
+        NSRunningApplication.current.activate(options: [.activateAllWindows])
+    }
+
     func chooseTarget() {
         let panel = NSOpenPanel()
         panel.title = "选择外置硬盘上的目标文件夹"
@@ -243,10 +257,8 @@ final class AppViewModel: ObservableObject {
         panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
 
-        // ad-hoc 手工打包的 App 可能处于未激活状态，此时同步 runModal 系统面板
-        // 会因窗口无法前置而假死（彩虹圈）。先激活 App，再用异步 begin 弹窗。
-        NSApp.setActivationPolicy(.regular)
-        NSRunningApplication.current.activate(options: [.activateAllWindows])
+        // 先激活 App，再用异步 begin 弹窗（同步 runModal 会假死）。
+        activateApp()
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor [weak self] in
@@ -269,8 +281,51 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - 迁移 / 还原
 
+    /// 「一键迁移」按钮入口：微信正在运行时先弹确认框引导退出，否则直接进迁移确认页。
+    func requestMigration() {
+        guard canMigrate else { return }
+        // 刷新一次运行状态，避免上次探测后用户又打开了微信。
+        wechat.isRunning = WeChatDetector.isRunning()
+        if wechat.isRunning {
+            showQuitWeChatConfirm = true
+        } else {
+            showMigrateSheet = true
+        }
+    }
+
+    /// 确认框「退出微信并继续」：优雅退出 → 等几秒 → 必要时强杀，成功后进迁移确认页。
+    func quitWeChatAndContinue() {
+        // AppleScript quit 可能触发「自动化」权限弹窗，先激活 App。
+        activateApp()
+        isQuittingWeChat = true
+        log("正在退出微信…")
+        Task.detached { [weak self] in
+            let quit = await WeChatQuitter.ensureQuit()
+            await self?.quitWeChatFinished(quit)
+        }
+    }
+
+    private func quitWeChatFinished(_ quit: Bool) {
+        isQuittingWeChat = false
+        wechat.isRunning = WeChatDetector.isRunning()
+        if quit && !wechat.isRunning {
+            log("✅ 微信已退出")
+            showMigrateSheet = true
+        } else {
+            lastError = "无法退出微信，请手动退出后重试。"
+            log("❌ 退出微信失败")
+        }
+    }
+
     func startMigration() {
         guard let base = targetBase else { return }
+        // 兜底：确认页打开期间微信又被启动，拒绝迁移。
+        wechat.isRunning = WeChatDetector.isRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再迁移。"
+            log("❌ 迁移被拒绝：微信正在运行")
+            return
+        }
         let todo = localItems
         isBusy = true
         progress = 0
@@ -358,25 +413,37 @@ final class AppViewModel: ObservableObject {
         refresh()
     }
 
-    /// osascript 提权弹窗会阻塞，放后台执行。
+    /// osascript 提权密码框：先激活 App（否则密码框可能无法前置），
+    /// 异步等待进程真正退出，期间 UI 显示「等待管理员授权…」。
     func resignWeChat() {
-        Task.detached { [weak self] in
-            let err = CodeSigner.resignWeChat()
-            await self?.resignFinished(error: err)
+        guard !isResigning else { return }
+        activateApp()
+        isResigning = true
+        log("正在重签名微信，等待管理员授权…")
+        CodeSigner.resignWeChat { [weak self] result in
+            Task { @MainActor [weak self] in
+                self?.resignFinished(result: result)
+            }
         }
     }
 
-    private func resignFinished(error: String?) {
-        if let error {
-            log("⚠️ 重签名未完成：\(error)")
-        } else {
+    private func resignFinished(result: CodeSigner.ResignResult) {
+        isResigning = false
+        switch result {
+        case .success:
             if let v = wechat.version {
                 UserDefaults.standard.set(v, forKey: DefaultsKey.lastSignedVersion)
             }
             log("✅ 微信重签名完成")
+            refresh()
+            checkSignatureNow()
+        case .cancelled:
+            // 用户在密码框点了取消：只提示，不算失败。
+            log("已取消授权，微信未重签名")
+        case .failed(let message):
+            log("⚠️ 重签名未完成：\(message)")
+            refresh()
         }
-        refresh()
-        if error == nil { checkSignatureNow() }
     }
 
     // MARK: - 删除备份

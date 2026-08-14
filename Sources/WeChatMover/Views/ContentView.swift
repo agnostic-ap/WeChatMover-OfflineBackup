@@ -52,6 +52,12 @@ struct ContentView: View {
         } message: {
             Text("将删除 \(vm.backupItems.count) 个备份目录（*_backup），释放约 \(DiskProbe.formatBytes(vm.totalBackupSize))。已逐项确认软链有效后才会删除，但删除后不可恢复。")
         }
+        .alert("微信正在运行", isPresented: $vm.showQuitWeChatConfirm) {
+            Button("退出微信并继续") { vm.quitWeChatAndContinue() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("需要先退出微信才能迁移。将优先优雅退出，几秒后仍未退出会强制结束；聊天记录不受影响。")
+        }
         .alert("操作失败", isPresented: errorPresented) {
             Button("好") { vm.lastError = nil }
         } message: {
@@ -103,30 +109,49 @@ struct ContentView: View {
     }
 
     private var actionButtons: some View {
-        HStack(spacing: 12) {
-            Button("一键迁移…") { vm.showMigrateSheet = true }
-                .buttonStyle(.borderedProminent)
-                .disabled(!vm.canMigrate)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Button("一键迁移…") { vm.requestMigration() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!vm.canMigrate)
 
-            Button("一键还原") { vm.startRestore() }
-                .disabled(!vm.canRestore)
+                Button("一键还原") { vm.startRestore() }
+                    .disabled(!vm.canRestore)
 
-            if !vm.backupItems.isEmpty {
-                Button("删除备份…") { vm.showBackupConfirm = true }
-                    .disabled(!vm.canDeleteBackups)
+                if !vm.backupItems.isEmpty {
+                    Button("删除备份…") { vm.showBackupConfirm = true }
+                        .disabled(!vm.canDeleteBackups)
+                }
+
+                if vm.wechatVersionChanged || vm.wechat.signatureValid == false {
+                    Button("重新签名微信") { vm.resignWeChat() }
+                        .disabled(vm.isBusy || vm.isResigning)
+                }
+
+                Button("权限指引") { vm.showGuide = true }
+
+                Spacer()
+
+                Button("刷新") { vm.refresh() }
+            }
+            .controlSize(.large)
+
+            if vm.isQuittingWeChat {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("正在退出微信…").foregroundStyle(.secondary)
+                }
+                .font(.callout)
             }
 
-            if vm.wechatVersionChanged || vm.wechat.signatureValid == false {
-                Button("重新签名微信") { vm.resignWeChat() }
-                    .disabled(vm.isBusy)
+            if vm.isResigning {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("正在重签名微信，等待管理员授权…（请在系统密码框中输入密码）")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.callout)
             }
-
-            Button("权限指引") { vm.showGuide = true }
-
-            Spacer()
-
-            Button("刷新") { vm.refresh() }
         }
-        .controlSize(.large)
     }
 }

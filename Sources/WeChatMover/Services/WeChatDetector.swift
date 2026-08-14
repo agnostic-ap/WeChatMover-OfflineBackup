@@ -28,6 +28,11 @@ enum WeChatDetector {
         return dict["CFBundleShortVersionString"] as? String
     }
 
+    /// 微信是否正在运行（NSRunningApplication 查询，毫秒级，任意线程可调）。
+    static func isRunning() -> Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+    }
+
     static func detect(appURL: URL = WeChatDetector.defaultAppURL) -> WeChatInfo {
         let installed = FileManager.default.fileExists(atPath: appURL.path)
         var info = WeChatInfo()
@@ -36,7 +41,7 @@ enum WeChatDetector {
             info.version = version(appURL: appURL)
             info.isAppStoreVersion = isAppStoreVersion(appURL: appURL)
         }
-        info.isRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+        info.isRunning = isRunning()
         return info
     }
 
