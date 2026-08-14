@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// 操作区（规范 5.5/5.6）：迁移中是进度面板；平时是居中的单一主按钮，
-/// 按状态切换（迁移 / 还原 / 恢复内置备份），同一时刻只显示一个。
+/// 按状态切换（迁移 / 还原外置数据 / 还原内置备份），同一时刻只显示一个。
 struct ActionSection: View {
     @EnvironmentObject var vm: AppViewModel
 
@@ -42,14 +42,14 @@ struct ActionSection: View {
                     .disabled(!vm.canMigrate)
                     .keyboardShortcut(.defaultAction)
             case .restore:
-                Button("还原到 Mac…") { vm.activeDialog = .restoreConfirm }
+                Button("还原外置存储数据到 Mac…") { vm.activeDialog = .restoreConfirm }
                     .buttonStyle(.borderedProminent)
                     .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
                     .frame(minWidth: 220, minHeight: 40)
                     .disabled(!vm.canRestore)
             case .restoreBackups:
-                Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
+                Button("还原内置存储数据到 Mac…") { vm.activeDialog = .backupRestoreConfirm }
                     .buttonStyle(.borderedProminent)
                     .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
@@ -77,7 +77,7 @@ struct ManageSection: View {
                         Text("部分数据已外置，可从外置硬盘还原回 Mac")
                             .font(.callout)
                         Spacer()
-                        Button("还原到 Mac…") { vm.activeDialog = .restoreConfirm }
+                        Button("还原外置存储数据到 Mac…") { vm.activeDialog = .restoreConfirm }
                             .controlSize(.small)
                             .disabled(!vm.canRestore)
                     }
@@ -91,12 +91,12 @@ struct ManageSection: View {
                             .font(.callout)
                             .monospacedDigit()
                         Spacer()
-                        // 「恢复内置备份…」是中央主按钮时（backupOnly 状态）这里不重复显示
+                        // 「还原内置存储数据到 Mac…」是中央主按钮时（backupOnly 状态）这里不重复显示
                         if showRestoreBackupsButton {
-                            Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
+                            Button("还原内置存储数据到 Mac…") { vm.activeDialog = .backupRestoreConfirm }
                                 .controlSize(.small)
                                 .disabled(!vm.canRestoreBackups)
-                                .help("放弃迁移，回到 Mac 上的旧数据（不需要外置硬盘）")
+                                .help("从本地备份还原：放弃迁移，回到 Mac 上的旧数据（不需要外置硬盘）")
                         }
                         Button("清理备份…") { vm.activeDialog = .backupConfirm }
                             .controlSize(.small)
@@ -108,7 +108,7 @@ struct ManageSection: View {
                         Image(systemName: "externaldrive")
                             .foregroundStyle(.secondary)
                         Text("外置数据占用 \(vm.externalDataSize.map(DiskProbe.formatBytes) ?? "统计中…")"
-                             + (vm.canCleanExternalData || vm.isBusy ? "" : " · 还原到 Mac 后可清理"))
+                             + (vm.canCleanExternalData || vm.isBusy ? "" : " · 还原数据到 Mac 后可清理"))
                             .font(.callout)
                             .monospacedDigit()
                         Spacer()
@@ -117,7 +117,7 @@ struct ManageSection: View {
                             .disabled(!vm.canCleanExternalData)
                             .help(vm.canCleanExternalData
                                   ? "删除外置硬盘上的 WeChatData"
-                                  : "还原到 Mac 后可清理")
+                                  : "还原数据到 Mac 后可清理")
                     }
                 }
             }
@@ -125,7 +125,7 @@ struct ManageSection: View {
         }
     }
 
-    /// 「恢复内置备份…」是中央主按钮时（backupOnly 状态），行内不重复显示。
+    /// 「还原内置存储数据到 Mac…」是中央主按钮时（backupOnly 状态），行内不重复显示。
     private var showRestoreBackupsButton: Bool {
         !vm.restorableBackupItems.isEmpty && vm.primaryAction != .restoreBackups
     }

@@ -10,7 +10,8 @@ enum StatusTone: Equatable {
 /// 进行中的操作种类（驱动横幅/进度面板文案）。
 enum BusyKind: Equatable {
     case migrating
-    case restoring
+    case restoring           // 从外置硬盘还原
+    case restoringBackups    // 从本地 _backup 还原
     case deletingBackups
     case sizingExternal
     case cleaningExternal
@@ -52,8 +53,8 @@ enum AppStatus: Equatable {
 enum PrimaryAction: Equatable {
     case none
     case migrate          // 迁移到外置硬盘 / 更新迁移
-    case restore          // 还原到 Mac…
-    case restoreBackups   // 恢复内置备份…（仅本地备份有数据时成为主操作）
+    case restore          // 还原外置存储数据到 Mac…
+    case restoreBackups   // 还原内置存储数据到 Mac…（仅本地备份有数据时成为主操作）
 }
 
 /// 横幅修复动作。

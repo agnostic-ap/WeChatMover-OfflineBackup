@@ -82,15 +82,15 @@ struct ContentView: View {
                 secondaryButton: .cancel())
         case .restoreConfirm:
             return Alert(
-                title: Text("还原微信数据到 Mac？"),
-                message: Text("将从外置硬盘把最新数据搬回 Mac（本地备份仍在时直接改回原名，否则完整拷回）；外置硬盘上的数据保留不动。如微信正在运行，将先自动退出。"),
+                title: Text("还原外置存储数据到 Mac？"),
+                message: Text("来源：外置硬盘上的 WeChatData → 目标：Mac 内置盘原位置。将把外置硬盘上的最新数据搬回 Mac（本地备份仍在时直接改回原名，否则完整拷回）；外置硬盘上的数据保留不动。如微信正在运行，将先自动退出。"),
                 primaryButton: .destructive(Text("确认还原")) { vm.confirmRestore() },
                 secondaryButton: .cancel())
         case .backupRestoreConfirm:
             return Alert(
-                title: Text("恢复内置备份？"),
-                message: Text("将删除符号链接，把内置盘上的 _backup 备份改回原名：放弃迁移，回到 Mac 上的旧数据。全程不访问外置硬盘（不插盘也能用），外置数据保留不动，可之后用「清理外置数据…」删除。如需保留外置盘上的最新数据，请改用「还原到 Mac…」。如微信正在运行，将先自动退出。"),
-                primaryButton: .destructive(Text("确认恢复")) { vm.confirmRestoreBackups() },
+                title: Text("还原内置存储数据到 Mac？"),
+                message: Text("来源：Mac 内置盘上的本地备份（_backup）→ 目标：Mac 内置盘原位置。将删除符号链接、把备份改回原名：放弃迁移，回到 Mac 上的旧数据。全程不访问外置硬盘（不插盘也能用），外置数据保留不动，可之后用「清理外置数据…」删除。如需保留外置盘上的最新数据，请改用「还原外置存储数据到 Mac…」。如微信正在运行，将先自动退出。"),
+                primaryButton: .destructive(Text("确认还原")) { vm.confirmRestoreBackups() },
                 secondaryButton: .cancel())
         case .backupConfirm:
             return Alert(

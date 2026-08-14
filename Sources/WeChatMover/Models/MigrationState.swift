@@ -177,7 +177,7 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 清理按钮可用性收紧：只有没有任何软链还指向外置数据（即已还原/恢复）才可点；
-    /// 已迁移状态置灰，Tooltip 说明「还原到 Mac 后可清理」。删除前的安全校验不变。
+    /// 已迁移状态置灰，Tooltip 说明「还原数据到 Mac 后可清理」。删除前的安全校验不变。
     var canCleanExternalData: Bool {
         guard let root = externalDataURL else { return false }
         return hasExternalData && !isBusy
@@ -194,7 +194,7 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 仅本地备份有数据：无本地数据、无有效迁移、无中断残留，但 _backup 存在。
-    /// 此时「恢复内置备份…」成为主操作。
+    /// 此时「还原内置存储数据到 Mac…」成为主操作。
     var isBackupOnlyState: Bool {
         localItems.isEmpty && migratedItems.isEmpty && interruptedItems.isEmpty
             && !backupItems.isEmpty
@@ -294,7 +294,7 @@ final class AppViewModel: ObservableObject {
             return BannerModel(
                 tone: .info, symbol: "internaldrive",
                 title: "检测到本地备份",
-                message: "外置硬盘未连接或未迁移，但 Mac 上留有 \(count) 项本地备份（共 \(DiskProbe.formatBytes(bytes))）。可用「恢复内置备份…」回到 Mac 上的旧数据，全程不需要外置硬盘。")
+                message: "外置硬盘未连接或未迁移，但 Mac 上留有 \(count) 项本地备份（共 \(DiskProbe.formatBytes(bytes))）。可用「还原内置存储数据到 Mac…」回到 Mac 上的旧数据，全程不需要外置硬盘。")
         case .blocked(let blocker):
             return Self.bannerForBlocker(blocker)
         case .busy(let kind, let value):
@@ -373,8 +373,13 @@ final class AppViewModel: ObservableObject {
         case .restoring:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
-                title: "正在还原到 Mac…",
+                title: "正在还原外置数据到 Mac…",
                 message: "还原期间请不要打开微信或拔出硬盘。")
+        case .restoringBackups:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在还原内置备份到 Mac…",
+                message: "还原期间请不要打开微信。")
         case .deletingBackups:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -657,12 +662,12 @@ final class AppViewModel: ObservableObject {
         quitWeChatIfRunning { [weak self] in self?.startMigration() }
     }
 
-    /// 还原确认框「确认还原」：与迁移一致，运行中先退出微信再还原。
+    /// 还原外置数据确认框「确认还原」：与迁移一致，运行中先退出微信再还原。
     func confirmRestore() {
         quitWeChatIfRunning { [weak self] in self?.startRestore() }
     }
 
-    /// 恢复内置备份确认框「确认恢复」：同样先确保微信已退出。
+    /// 还原内置备份确认框「确认还原」：同样先确保微信已退出。
     func confirmRestoreBackups() {
         quitWeChatIfRunning { [weak self] in self?.startRestoreBackups() }
     }
@@ -847,29 +852,29 @@ final class AppViewModel: ObservableObject {
         refresh()
     }
 
-    // MARK: - 恢复内置备份
+    // MARK: - 还原内置备份
 
-    /// 仅用本地 _backup 恢复：删软链 → 备份改名回原名，完全不访问外置盘（不插盘也能用）。
+    /// 仅用本地 _backup 还原：删软链 → 备份改名回原名，完全不访问外置盘（不插盘也能用）。
     func startRestoreBackups() {
-        // 兜底：确认框打开期间微信又被启动，拒绝恢复。
+        // 兜底：确认框打开期间微信又被启动，拒绝还原。
         wechat.isRunning = isWeChatRunning()
         guard !wechat.isRunning else {
-            lastError = "微信正在运行，请先退出微信再恢复内置备份。"
-            log("❌ 恢复内置备份被拒绝：微信正在运行")
+            lastError = "微信正在运行，请先退出微信再还原内置备份。"
+            log("❌ 还原内置备份被拒绝：微信正在运行")
             return
         }
         let todo = restorableBackupItems
         guard !todo.isEmpty else { return }
         isBusy = true
-        busyKind = .restoring
+        busyKind = .restoringBackups
         migrationOutcome = nil
-        log("开始恢复内置备份 \(todo.count) 个目录 …")
+        log("开始还原内置备份 \(todo.count) 个目录 …")
         Task.detached { [weak self] in
             var failed: String? = nil
             do {
                 for item in todo {
                     try Migrator.restoreFromBackup(source: item.source)
-                    await self?.log("✅ 已恢复内置备份：\(item.displayName)")
+                    await self?.log("✅ 已还原内置备份：\(item.displayName)")
                 }
             } catch {
                 failed = error.localizedDescription
@@ -883,9 +888,9 @@ final class AppViewModel: ObservableObject {
         busyKind = nil
         if let error {
             lastError = error
-            log("❌ 恢复内置备份失败：\(error)")
+            log("❌ 还原内置备份失败：\(error)")
         } else {
-            log("已恢复内置备份，正在重签名微信…")
+            log("已还原内置备份，正在重签名微信…")
             resignWeChat()
         }
         refresh()

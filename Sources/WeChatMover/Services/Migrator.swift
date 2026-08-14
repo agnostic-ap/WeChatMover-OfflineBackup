@@ -154,9 +154,9 @@ enum Migrator {
         try? fm.removeItem(at: target)
     }
 
-    // MARK: - 恢复内置备份
+    // MARK: - 还原内置备份
 
-    /// 仅用本地 _backup 恢复：删软链 + 备份改名回原名。
+    /// 仅用本地 _backup 还原：删软链 + 备份改名回原名。
     /// 完全不访问外置盘（不插盘也能用）；备份不存在时拒绝（改用完整还原）。
     static func restoreFromBackup(source: URL) throws {
         let fm = FileManager.default

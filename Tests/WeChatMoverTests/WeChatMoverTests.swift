@@ -938,7 +938,7 @@ private func makePresentationVM() -> AppViewModel {
     #expect(plain.text == "[13:49:07] 开始迁移")
 }
 
-// MARK: - 恢复内置备份（Migrator 层，不访问外置盘）
+// MARK: - 还原内置备份（Migrator 层，不访问外置盘）
 
 @Test func restoreFromBackupOnly() throws {
     try withTempDir { root in
@@ -1003,7 +1003,7 @@ private func makePresentationVM() -> AppViewModel {
         #expect(vm.hasExternalData)
         #expect(!vm.canCleanExternalData)
 
-        // 还原到 Mac 后（无软链指向外置）→ 点亮
+        // 还原后（无软链指向外置）→ 点亮
         try Migrator.restoreItem(source: source, target: target)
         vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
                                state: .local, size: 128, hasBackup: false, backupSize: 0)]
@@ -1011,7 +1011,7 @@ private func makePresentationVM() -> AppViewModel {
     }
 }
 
-// MARK: - 还原/恢复内置备份的退微信流程（注入假 quitter，不碰真实微信）
+// MARK: - 还原/还原内置备份的退微信流程（注入假 quitter，不碰真实微信）
 
 private final class RunningFlag: @unchecked Sendable { var value = true }
 private final class CallFlag: @unchecked Sendable { var value = false }
@@ -1082,7 +1082,7 @@ private final class CallFlag: @unchecked Sendable { var value = false }
         atPath: WeChatPaths.backupDirectory(for: source).path))   // 备份已改名回原名
     #expect(FileManager.default.fileExists(atPath: target.path))  // 外置数据保留
     #expect(vm.lastError == nil)
-    #expect(vm.logs.contains { $0.contains("已恢复内置备份") })
+    #expect(vm.logs.contains { $0.contains("已还原内置备份") })
 }
 
 // MARK: - 卡片图标模型（微信真实图标 / 目标磁盘微信绿）
@@ -1112,12 +1112,12 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     #expect(vm.isBackupOnlyState)
     #expect(vm.appStatus == .backupOnly(count: 1, bytes: 427_000_000))
     #expect(vm.banner.title == "检测到本地备份")
-    #expect(vm.banner.message.contains("恢复内置备份"))
+    #expect(vm.banner.message.contains("还原内置存储数据到 Mac…"))
     // 断链软链也可恢复（restoreFromBackup 不访问外置盘）
     #expect(vm.restorableBackupItems.count == 1)
     #expect(vm.canRestoreBackups)
     #expect(vm.canDeleteBackups)   // 备份行仍可清理
-    // 主按钮是「恢复内置备份…」
+    // 主按钮是「还原内置存储数据到 Mac…」
     #expect(vm.primaryAction == .restoreBackups)
 }
 
