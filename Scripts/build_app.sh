@@ -12,6 +12,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp ".build/release/WeChatMover" "$APP/Contents/MacOS/WeChatMover"
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> ad-hoc 签名"
 codesign --force --sign - "$APP"

@@ -129,6 +129,8 @@ Sources/WeChatMover/
     └── AppManagementGuideView.swift # 重签名受阻指引（App 管理/终端兜底）
 Scripts/
 ├── build_app.sh               # 构建并组装 .app（ad-hoc 签名）
+├── make_icon.swift            # AppKit 离屏绘制应用图标（微信绿气泡+右箭头）
+├── make_icon.sh               # 重新生成 Resources/AppIcon.icns（绘制 + iconutil）
 └── test.sh                    # CLT 环境下跑 Swift Testing 的包装脚本
 ```
 

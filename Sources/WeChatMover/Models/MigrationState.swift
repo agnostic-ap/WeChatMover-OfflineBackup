@@ -437,7 +437,7 @@ final class AppViewModel: ObservableObject {
         let detail = "微信 \(wechat.version ?? "—") · \(signature)"
         return StatusCardModel(
             id: "safety", title: "安全检查", value: value, detail: detail,
-            symbol: issues.isEmpty ? "checkmark.shield" : "exclamationmark.shield",
+            symbol: issues.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
             tone: issues.isEmpty ? .success : .warning)
     }
 
