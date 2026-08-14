@@ -184,13 +184,20 @@ final class AppViewModel: ObservableObject {
             && !Self.isExternalDataInUse(items: items, dataRoot: root)
     }
 
-    /// 已迁移且本地 _backup 仍在的项（可「恢复内置备份」）。
+    /// 本地 _backup 仍在且源位是软链（有效或断链均可——恢复流程不依赖外置盘）的项。
     var restorableBackupItems: [ItemStatus] {
-        migratedItems.filter { $0.hasBackup }
+        items.filter { $0.hasBackup && ($0.state == .migrated || $0.state == .brokenSymlink) }
     }
 
     var canRestoreBackups: Bool {
         !restorableBackupItems.isEmpty && !isBusy && !isQuittingWeChat
+    }
+
+    /// 仅本地备份有数据：无本地数据、无有效迁移、无中断残留，但 _backup 存在。
+    /// 此时「恢复内置备份…」成为主操作。
+    var isBackupOnlyState: Bool {
+        localItems.isEmpty && migratedItems.isEmpty && interruptedItems.isEmpty
+            && !backupItems.isEmpty
     }
 
     // MARK: - 展示模型（状态 → 横幅/卡片，纯映射，可单测）
@@ -204,6 +211,14 @@ final class AppViewModel: ObservableObject {
     /// 主按钮文案：已有部分数据外置时为「更新迁移」。
     var primaryActionTitle: String {
         migratedItems.isEmpty ? "迁移到外置硬盘" : "更新迁移"
+    }
+
+    /// 当前应显示的主操作（同一时刻只有一个）。
+    var primaryAction: PrimaryAction {
+        if isBackupOnlyState { return .restoreBackups }
+        if !localItems.isEmpty { return .migrate }
+        if !migratedItems.isEmpty { return .restore }
+        return .none
     }
 
     /// 安全检查待处理项（安全卡片与安全详情共用）。
@@ -240,6 +255,10 @@ final class AppViewModel: ObservableObject {
         guard !wechat.isAppStoreVersion else { return .blocked(.appStoreVersion) }
         guard containerReadable else { return .blocked(.containerUnreadable) }
         guard interruptedItems.isEmpty else { return .blocked(.interruptedResidue) }
+        // 仅本地备份有数据（外置未连接/未迁移）：给出恢复入口，优先于"硬盘未连接"警告
+        if isBackupOnlyState {
+            return .backupOnly(count: backupItems.count, bytes: totalBackupSize)
+        }
         guard brokenItems.isEmpty else { return .blocked(.diskDisconnected) }
         guard targetBase != nil else { return .blocked(.noDestination) }
         guard isTargetAPFS else {
@@ -271,6 +290,11 @@ final class AppViewModel: ObservableObject {
                 tone: .success, symbol: "checkmark.seal.fill",
                 title: "微信数据已在外置硬盘",
                 message: "全部数据已迁移到 \(destinationName)。外置盘未连接时请不要打开微信。")
+        case .backupOnly(let count, let bytes):
+            return BannerModel(
+                tone: .info, symbol: "internaldrive",
+                title: "检测到本地备份",
+                message: "外置硬盘未连接或未迁移，但 Mac 上留有 \(count) 项本地备份（共 \(DiskProbe.formatBytes(bytes))）。可用「恢复内置备份…」回到 Mac 上的旧数据，全程不需要外置硬盘。")
         case .blocked(let blocker):
             return Self.bannerForBlocker(blocker)
         case .busy(let kind, let value):

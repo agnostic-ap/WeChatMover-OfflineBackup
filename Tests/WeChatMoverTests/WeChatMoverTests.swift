@@ -1098,3 +1098,53 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     #expect(empty.summaryCards[0].symbol == "message.circle.fill")
     #expect(empty.summaryCards[0].iconUsesAccent)
 }
+
+// MARK: - 仅本地备份状态（backupOnly）与主按钮切换
+
+@MainActor @Test func backupOnlyStatePresentation() {
+    let vm = AppViewModel()
+    vm.wechat.isInstalled = true
+    // 外置未连接：源位是断链软链，本地 _backup 有数据
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/c/Documents/xwechat_files"),
+                           state: .brokenSymlink, size: 0,
+                           hasBackup: true, backupSize: 427_000_000)]
+    #expect(vm.isBackupOnlyState)
+    #expect(vm.appStatus == .backupOnly(count: 1, bytes: 427_000_000))
+    #expect(vm.banner.title == "检测到本地备份")
+    #expect(vm.banner.message.contains("恢复内置备份"))
+    // 断链软链也可恢复（restoreFromBackup 不访问外置盘）
+    #expect(vm.restorableBackupItems.count == 1)
+    #expect(vm.canRestoreBackups)
+    // 主按钮是「恢复内置备份…」
+    #expect(vm.primaryAction == .restoreBackups)
+}
+
+@MainActor @Test func primaryActionSwitching() {
+    let vm = AppViewModel()
+    vm.wechat.isInstalled = true
+    // 未迁移 → 迁移
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/a"),
+                           state: .local, size: 100, hasBackup: false, backupSize: 0)]
+    #expect(vm.primaryAction == .migrate)
+    #expect(vm.primaryActionTitle == "迁移到外置硬盘")
+
+    // 部分外置 → 仍是迁移（更新迁移），还原降级到管理行
+    vm.items.append(ItemStatus(subdir: "Documents/app_data",
+                               source: URL(fileURLWithPath: "/tmp/b"),
+                               state: .migrated, size: 100, hasBackup: true, backupSize: 100))
+    #expect(vm.primaryAction == .migrate)
+    #expect(vm.primaryActionTitle == "更新迁移")
+
+    // 全部外置 → 还原
+    vm.items = [ItemStatus(subdir: "Documents/app_data",
+                           source: URL(fileURLWithPath: "/tmp/b"),
+                           state: .migrated, size: 100, hasBackup: true, backupSize: 100)]
+    #expect(vm.primaryAction == .restore)
+    #expect(!vm.isBackupOnlyState)
+
+    // 空状态 → 无主按钮
+    vm.items = []
+    #expect(vm.primaryAction == .none)
+}

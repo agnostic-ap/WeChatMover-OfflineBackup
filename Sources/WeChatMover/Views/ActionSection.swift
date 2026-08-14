@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// 操作区（规范 5.5/5.6）：迁移中是进度面板；平时是单一主按钮 + 次按钮。
+/// 操作区（规范 5.5/5.6）：迁移中是进度面板；平时是居中的单一主按钮，
+/// 按状态切换（迁移 / 还原 / 恢复内置备份），同一时刻只显示一个。
 struct ActionSection: View {
     @EnvironmentObject var vm: AppViewModel
 
@@ -8,11 +9,12 @@ struct ActionSection: View {
         if vm.busyKind == .migrating {
             progressPanel
         } else {
-            actionRow
+            primaryButton
         }
     }
 
-    /// 迁移进度面板：只保留步骤与说明文字；进度条与百分比以顶部横幅为准（不重复展示）。
+    /// 迁移进度面板：与页面内容区等宽（横向拉满，与状态横幅同宽）；
+    /// 只保留步骤与说明文字，进度条与百分比以顶部横幅为准（不重复展示）。
     private var progressPanel: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
             Text("正在复制微信数据")
@@ -21,39 +23,54 @@ struct ActionSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .cardStyle()
     }
 
-    private var actionRow: some View {
-        HStack(spacing: DesignTokens.Spacing.sm) {
-            // 已外置（无待迁移）时隐藏主按钮
-            if !vm.localItems.isEmpty {
+    /// 居中的单一主按钮（微信绿大按钮，高约 40pt）。
+    @ViewBuilder
+    private var primaryButton: some View {
+        HStack {
+            Spacer()
+            switch vm.primaryAction {
+            case .migrate:
                 Button(vm.primaryActionTitle) { vm.requestMigration() }
                     .buttonStyle(.borderedProminent)
                     .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
-                    .frame(minHeight: 40)
+                    .frame(minWidth: 220, minHeight: 40)
                     .disabled(!vm.canMigrate)
                     .keyboardShortcut(.defaultAction)
-            }
-
-            if !vm.migratedItems.isEmpty {
+            case .restore:
                 Button("还原到 Mac…") { vm.activeDialog = .restoreConfirm }
+                    .buttonStyle(.borderedProminent)
+                    .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
+                    .frame(minWidth: 220, minHeight: 40)
                     .disabled(!vm.canRestore)
+            case .restoreBackups:
+                Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
+                    .buttonStyle(.borderedProminent)
+                    .tint(DesignTokens.Colors.accent)
+                    .controlSize(.large)
+                    .frame(minWidth: 220, minHeight: 40)
+                    .disabled(!vm.canRestoreBackups)
+            case .none:
+                EmptyView()
             }
+            Spacer()
         }
     }
 }
 
-/// 管理行：恢复内置备份 / 本地备份 / 外置数据清理入口（均二次确认）。
+/// 管理行（次级入口，弱化小号按钮）：恢复内置备份 / 还原 / 清理备份 / 清理外置数据。
 struct ManageSection: View {
     @EnvironmentObject var vm: AppViewModel
 
     var body: some View {
-        if !vm.restorableBackupItems.isEmpty || !vm.backupItems.isEmpty || vm.hasExternalData {
+        if showRestoreBackupsRow || showRestoreRow || !vm.backupItems.isEmpty || vm.hasExternalData {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-                if !vm.restorableBackupItems.isEmpty {
+                if showRestoreBackupsRow {
                     HStack(spacing: DesignTokens.Spacing.xs) {
                         Image(systemName: "arrow.uturn.backward.circle")
                             .foregroundStyle(.secondary)
@@ -63,6 +80,18 @@ struct ManageSection: View {
                         Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
                             .controlSize(.small)
                             .disabled(!vm.canRestoreBackups)
+                    }
+                }
+                if showRestoreRow {
+                    HStack(spacing: DesignTokens.Spacing.xs) {
+                        Image(systemName: "arrow.uturn.backward")
+                            .foregroundStyle(.secondary)
+                        Text("部分数据已外置，可从外置硬盘还原回 Mac")
+                            .font(.callout)
+                        Spacer()
+                        Button("还原到 Mac…") { vm.activeDialog = .restoreConfirm }
+                            .controlSize(.small)
+                            .disabled(!vm.canRestore)
                     }
                 }
                 if !vm.backupItems.isEmpty {
@@ -98,5 +127,15 @@ struct ManageSection: View {
             }
             .cardStyle()
         }
+    }
+
+    /// 「恢复内置备份」在主操作位显示时，管理行不重复出现。
+    private var showRestoreBackupsRow: Bool {
+        !vm.restorableBackupItems.isEmpty && vm.primaryAction != .restoreBackups
+    }
+
+    /// 部分外置（还有待迁移）时主按钮是「更新迁移」，还原降级到管理行。
+    private var showRestoreRow: Bool {
+        !vm.migratedItems.isEmpty && vm.primaryAction != .restore
     }
 }

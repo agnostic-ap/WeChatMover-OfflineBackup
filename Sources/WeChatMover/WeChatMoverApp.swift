@@ -11,7 +11,7 @@ struct WeChatMoverApp: App {
                 .frame(minWidth: 760, minHeight: 580)
                 .onAppear { viewModel.refresh() }
         }
-        .defaultSize(width: 920, height: 680)
+        .defaultSize(width: 920, height: 720)
         .windowResizability(.contentSize)
     }
 }

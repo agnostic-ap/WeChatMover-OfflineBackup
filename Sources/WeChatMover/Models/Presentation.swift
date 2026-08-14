@@ -41,10 +41,19 @@ enum AppStatus: Equatable {
     case checking
     case ready
     case externalized                       // 全部已外置，无待迁移
+    case backupOnly(count: Int, bytes: Int64)  // 仅本地备份有数据（外置未连接/未迁移），可恢复
     case blocked(Blocker)
     case busy(BusyKind, progress: Double?)  // 拿不到字节进度时 progress 为 nil（步骤文案代替）
     case succeeded(String)                  // 摘要文案
     case failed(String)                     // 用户可理解的原因
+}
+
+/// 主操作按钮（同一时刻只显示一个，按状态切换）。
+enum PrimaryAction: Equatable {
+    case none
+    case migrate          // 迁移到外置硬盘 / 更新迁移
+    case restore          // 还原到 Mac…
+    case restoreBackups   // 恢复内置备份…（仅本地备份有数据时成为主操作）
 }
 
 /// 横幅修复动作。
