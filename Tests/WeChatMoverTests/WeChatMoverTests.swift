@@ -769,7 +769,8 @@ private func makeSignableFixtureApp(root: URL) throws -> URL {
     vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
                            state: .migrated, size: 128, hasBackup: true, backupSize: 128)]
 
-    // 迁移中 → 拒绝，弹中性提示，不弹确认框、不删数据
+    // 迁移中 → 按钮置灰；直接调用也仍被拒绝（防御性校验保留），弹中性提示
+    #expect(!vm.canCleanExternalData)
     vm.requestCleanExternalData()
     #expect(vm.notice?.contains("仍在使用中") == true)
     #expect(!vm.showCleanExternalConfirm)
@@ -935,4 +936,165 @@ private func makePresentationVM() -> AppViewModel {
     let plain = LogPresentation.parse("[13:49:07] 开始迁移")
     #expect(plain.tone == .neutral)
     #expect(plain.text == "[13:49:07] 开始迁移")
+}
+
+// MARK: - 恢复内置备份（Migrator 层，不访问外置盘）
+
+@Test func restoreFromBackupOnly() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [256])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: target)
+
+        try Migrator.restoreFromBackup(source: source)
+        #expect(itemState(at: source) == .local)
+        #expect(DiskProbe.directorySize(at: source) == 256)
+        #expect(!FileManager.default.fileExists(
+            atPath: WeChatPaths.backupDirectory(for: source).path))
+        #expect(FileManager.default.fileExists(atPath: target.path))   // 外置数据保留不动
+    }
+}
+
+@Test func restoreFromBackupRefusals() throws {
+    try withTempDir { root in
+        // 非软链 → notMigrated
+        let local = try makeDataDir(root: root, "c/Documents/app_data")
+        #expect {
+            try Migrator.restoreFromBackup(source: local)
+        } throws: { error in
+            guard case MigrationError.notMigrated = error else { return false }
+            return true
+        }
+
+        // 软链但无 _backup → backupMissing（应改用完整还原）
+        let source = root.appendingPathComponent("c2/Documents/xwechat_files")
+        try FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: source, withDestinationURL: root.appendingPathComponent("c"))
+        #expect {
+            try Migrator.restoreFromBackup(source: source)
+        } throws: { error in
+            guard case MigrationError.backupMissing = error else { return false }
+            return true
+        }
+    }
+}
+
+// MARK: - 清理外置数据按钮可用性收紧
+
+@MainActor @Test func cleanExternalButtonAvailability() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: target)
+
+        let vm = AppViewModel()
+        vm.targetBase = base
+        vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                               state: .migrated, size: 128, hasBackup: true, backupSize: 128)]
+        // 已迁移（软链仍指向外置）→ 置灰
+        #expect(vm.hasExternalData)
+        #expect(!vm.canCleanExternalData)
+
+        // 还原到 Mac 后（无软链指向外置）→ 点亮
+        try Migrator.restoreItem(source: source, target: target)
+        vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                               state: .local, size: 128, hasBackup: false, backupSize: 0)]
+        #expect(vm.canCleanExternalData)
+    }
+}
+
+// MARK: - 还原/恢复内置备份的退微信流程（注入假 quitter，不碰真实微信）
+
+private final class RunningFlag: @unchecked Sendable { var value = true }
+private final class CallFlag: @unchecked Sendable { var value = false }
+
+@MainActor @Test func confirmRestoreQuitsWeChatFirst() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    try Migrator.migrateItem(
+        source: source,
+        target: WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files"))
+
+    let running = RunningFlag()
+    let quitterCalled = CallFlag()
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { running.value }
+    vm.wechatQuitter = { quitterCalled.value = true; running.value = false; return true }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.wechat.isRunning = true   // 微信运行中
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .migrated, size: 128, hasBackup: true, backupSize: 128)]
+
+    // 运行中不再禁用还原
+    #expect(vm.canRestore)
+    vm.confirmRestore()
+    let restored = await waitUntil { itemState(at: source) == .local && !vm.isBusy }
+    #expect(restored)
+    #expect(quitterCalled.value)                   // 先退了微信
+    #expect(vm.logs.contains { $0.contains("已还原") })
+}
+
+@MainActor @Test func restoreBackupsFlow() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128, 256])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+    try Migrator.migrateItem(source: source, target: target)
+
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .migrated, size: 384, hasBackup: true, backupSize: 384)]
+
+    #expect(vm.canRestoreBackups)
+    vm.confirmRestoreBackups()
+    let restored = await waitUntil { itemState(at: source) == .local && !vm.isBusy }
+    #expect(restored)
+    #expect(!FileManager.default.fileExists(
+        atPath: WeChatPaths.backupDirectory(for: source).path))   // 备份已改名回原名
+    #expect(FileManager.default.fileExists(atPath: target.path))  // 外置数据保留
+    #expect(vm.lastError == nil)
+    #expect(vm.logs.contains { $0.contains("已恢复内置备份") })
+}
+
+// MARK: - 卡片图标模型（微信真实图标 / 目标磁盘微信绿）
+
+@MainActor @Test func cardIconModels() {
+    let vm = makePresentationVM()
+    let cards = vm.summaryCards
+    #expect(cards[0].customIcon == .weChatApp)     // 已安装 → 真实微信图标
+    #expect(cards[1].iconUsesAccent)               // 目标磁盘图标用微信绿
+    // 未安装 → 降级绿色 message.circle.fill
+    let empty = AppViewModel()
+    #expect(empty.summaryCards[0].customIcon == nil)
+    #expect(empty.summaryCards[0].symbol == "message.circle.fill")
+    #expect(empty.summaryCards[0].iconUsesAccent)
 }

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// 三张摘要卡片（规范 5.3）：微信数据 / 目标磁盘 / 安全检查。
 /// 窄窗口（<820pt 等效）时由 ViewThatFits 自动从三列退化为单列。
@@ -84,7 +85,7 @@ struct StatusSummaryGrid: View {
     }
 }
 
-/// 单张摘要卡片：左上标签、左下主值+副文案、右上 SF Symbol。
+/// 单张摘要卡片：左上标签、左下主值+副文案、右上图标（支持真实微信图标）。
 struct StatusCard: View {
     let model: StatusCardModel
 
@@ -95,9 +96,7 @@ struct StatusCard: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Image(systemName: model.symbol)
-                    .font(.title2)
-                    .foregroundStyle(DesignTokens.toneColor(model.tone))
+                icon
             }
             Spacer(minLength: 0)
             Text(model.value)
@@ -111,5 +110,26 @@ struct StatusCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .cardStyle()
         .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        if model.customIcon == .weChatApp {
+            // 运行时取微信 App 真实图标，无需打包资源
+            Image(nsImage: NSWorkspace.shared.icon(forFile: CodeSigner.wechatAppPath))
+                .resizable()
+                .frame(width: 24, height: 24)
+        } else {
+            Image(systemName: model.symbol)
+                .font(.title2)
+                .foregroundStyle(iconColor)
+        }
+    }
+
+    private var iconColor: Color {
+        if model.iconUsesAccent, model.tone == .neutral || model.tone == .info {
+            return DesignTokens.Colors.accent
+        }
+        return DesignTokens.toneColor(model.tone)
     }
 }

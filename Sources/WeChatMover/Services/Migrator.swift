@@ -154,6 +154,27 @@ enum Migrator {
         try? fm.removeItem(at: target)
     }
 
+    // MARK: - 恢复内置备份
+
+    /// 仅用本地 _backup 恢复：删软链 + 备份改名回原名。
+    /// 完全不访问外置盘（不插盘也能用）；备份不存在时拒绝（改用完整还原）。
+    static func restoreFromBackup(source: URL) throws {
+        let fm = FileManager.default
+        guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
+        let backup = backupURL(for: source)
+        guard fm.fileExists(atPath: backup.path) else { throw MigrationError.backupMissing(backup.path) }
+        // 先记下软链目标用于失败回滚（只读，不访问目标本身）
+        let dest = try? fm.destinationOfSymbolicLink(atPath: source.path)
+        try fm.removeItem(at: source)
+        do {
+            try fm.moveItem(at: backup, to: source)
+        } catch {
+            try? fm.removeItem(at: source)
+            if let dest { try? fm.createSymbolicLink(atPath: source.path, withDestinationPath: dest) }
+            throw error
+        }
+    }
+
     // MARK: - 前置检查
 
     /// 检查目标卷剩余空间是否装得下这些数据。

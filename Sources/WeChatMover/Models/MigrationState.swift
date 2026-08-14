@@ -105,6 +105,8 @@ final class AppViewModel: ObservableObject {
     var isAppBundleWritable: () -> Bool = { CodeSigner.isWritableByCurrentUser() }
     /// 重签名后的 codesign -v 复核（测试可注入假实现，避免扫真实 App）。
     var signatureVerifier: @Sendable () -> Bool = { WeChatDetector.checkSignature() }
+    /// 退出微信流程（测试可注入假实现，不触碰真实微信）。
+    var wechatQuitter: @Sendable () async -> Bool = { await WeChatQuitter.ensureQuit() }
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -154,8 +156,9 @@ final class AppViewModel: ObservableObject {
             && containerReadable && interruptedItems.isEmpty && !isBusy && !isQuittingWeChat
     }
 
+    /// 还原按钮是否可用。微信运行中不再禁用：确认后由 confirmRestore() 先退出微信。
     var canRestore: Bool {
-        !migratedItems.isEmpty && !wechat.isRunning && !isBusy
+        !migratedItems.isEmpty && !isBusy && !isQuittingWeChat
     }
 
     var canDeleteBackups: Bool {
@@ -173,8 +176,21 @@ final class AppViewModel: ObservableObject {
         return FileManager.default.fileExists(atPath: url.path)
     }
 
+    /// 清理按钮可用性收紧：只有没有任何软链还指向外置数据（即已还原/恢复）才可点；
+    /// 已迁移状态置灰，Tooltip 说明「还原到 Mac 后可清理」。删除前的安全校验不变。
     var canCleanExternalData: Bool {
-        hasExternalData && !isBusy
+        guard let root = externalDataURL else { return false }
+        return hasExternalData && !isBusy
+            && !Self.isExternalDataInUse(items: items, dataRoot: root)
+    }
+
+    /// 已迁移且本地 _backup 仍在的项（可「恢复内置备份」）。
+    var restorableBackupItems: [ItemStatus] {
+        migratedItems.filter { $0.hasBackup }
+    }
+
+    var canRestoreBackups: Bool {
+        !restorableBackupItems.isEmpty && !isBusy && !isQuittingWeChat
     }
 
     // MARK: - 展示模型（状态 → 横幅/卡片，纯映射，可单测）
@@ -381,15 +397,22 @@ final class AppViewModel: ObservableObject {
         } else {
             detail = "位于 Mac"; symbol = "internaldrive"; tone = .neutral
         }
+        // 已安装时用真实微信图标；未安装降级为绿色消息气泡
+        let customIcon: CardIcon? = wechat.isInstalled ? .weChatApp : nil
         return StatusCardModel(id: "data", title: "微信数据", value: value,
-                               detail: detail, symbol: symbol, tone: tone)
+                               detail: detail,
+                               symbol: wechat.isInstalled ? symbol : "message.circle.fill",
+                               tone: wechat.isInstalled ? tone : .neutral,
+                               customIcon: customIcon,
+                               iconUsesAccent: !wechat.isInstalled)
     }
 
     private var destinationCard: StatusCardModel {
         guard targetBase != nil else {
             return StatusCardModel(id: "destination", title: "目标磁盘", value: "未选择",
                                    detail: "选择一个外置硬盘文件夹",
-                                   symbol: "externaldrive", tone: .neutral)
+                                   symbol: "externaldrive", tone: .neutral,
+                                   iconUsesAccent: true)
         }
         let value = targetFreeSpace.map { DiskProbe.formatBytes($0) + " 可用" } ?? "—"
         let detail = "\(destinationName) · \(targetFSType ?? "未知格式")"
@@ -398,7 +421,8 @@ final class AppViewModel: ObservableObject {
         if sizesLoaded, !localItems.isEmpty,
            let free = targetFreeSpace, free < totalLocalSize { tone = .warning }
         return StatusCardModel(id: "destination", title: "目标磁盘", value: value,
-                               detail: detail, symbol: "externaldrive.fill", tone: tone)
+                               detail: detail, symbol: "externaldrive.fill", tone: tone,
+                               iconUsesAccent: true)
     }
 
     private var safetyCard: StatusCardModel {
@@ -606,27 +630,40 @@ final class AppViewModel: ObservableObject {
 
     /// 确认框「退出微信并开始迁移」：运行中先优雅退出（必要时强杀），成功后直接开始迁移。
     func confirmMigration() {
+        quitWeChatIfRunning { [weak self] in self?.startMigration() }
+    }
+
+    /// 还原确认框「确认还原」：与迁移一致，运行中先退出微信再还原。
+    func confirmRestore() {
+        quitWeChatIfRunning { [weak self] in self?.startRestore() }
+    }
+
+    /// 恢复内置备份确认框「确认恢复」：同样先确保微信已退出。
+    func confirmRestoreBackups() {
+        quitWeChatIfRunning { [weak self] in self?.startRestoreBackups() }
+    }
+
+    /// 微信运行中先退出（优雅 → 必要时强杀），成功后才执行后续操作。
+    private func quitWeChatIfRunning(then operation: @escaping @MainActor () -> Void) {
         // AppleScript quit 可能触发「自动化」权限弹窗，先激活 App。
         activateApp()
         wechat.isRunning = isWeChatRunning()
-        if wechat.isRunning {
-            isQuittingWeChat = true
-            log("正在退出微信…")
-            Task.detached { [weak self] in
-                let quit = await WeChatQuitter.ensureQuit()
-                await self?.quitWeChatFinished(quit)
-            }
-        } else {
-            startMigration()
+        guard wechat.isRunning else { operation(); return }
+        isQuittingWeChat = true
+        log("正在退出微信…")
+        let quitter = wechatQuitter
+        Task.detached { [weak self] in
+            let quit = await quitter()
+            await self?.quitWeChatFinished(quit, then: operation)
         }
     }
 
-    private func quitWeChatFinished(_ quit: Bool) {
+    private func quitWeChatFinished(_ quit: Bool, then operation: @MainActor () -> Void) {
         isQuittingWeChat = false
         wechat.isRunning = isWeChatRunning()
         if quit && !wechat.isRunning {
             log("✅ 微信已退出")
-            startMigration()
+            operation()
         } else {
             lastError = "无法退出微信，请手动退出后重试。"
             log("❌ 退出微信失败")
@@ -744,6 +781,13 @@ final class AppViewModel: ObservableObject {
 
     func startRestore() {
         guard let base = targetBase else { return }
+        // 兜底：确认框打开期间微信又被启动，拒绝还原。
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再还原。"
+            log("❌ 还原被拒绝：微信正在运行")
+            return
+        }
         let todo = migratedItems
         isBusy = true
         busyKind = .restoring
@@ -774,6 +818,50 @@ final class AppViewModel: ObservableObject {
             log("❌ 还原失败：\(error)")
         } else {
             log("全部还原完成，正在重签名微信…")
+            resignWeChat()
+        }
+        refresh()
+    }
+
+    // MARK: - 恢复内置备份
+
+    /// 仅用本地 _backup 恢复：删软链 → 备份改名回原名，完全不访问外置盘（不插盘也能用）。
+    func startRestoreBackups() {
+        // 兜底：确认框打开期间微信又被启动，拒绝恢复。
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再恢复内置备份。"
+            log("❌ 恢复内置备份被拒绝：微信正在运行")
+            return
+        }
+        let todo = restorableBackupItems
+        guard !todo.isEmpty else { return }
+        isBusy = true
+        busyKind = .restoring
+        migrationOutcome = nil
+        log("开始恢复内置备份 \(todo.count) 个目录 …")
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                for item in todo {
+                    try Migrator.restoreFromBackup(source: item.source)
+                    await self?.log("✅ 已恢复内置备份：\(item.displayName)")
+                }
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.restoreBackupsFinished(error: failed)
+        }
+    }
+
+    private func restoreBackupsFinished(error: String?) {
+        isBusy = false
+        busyKind = nil
+        if let error {
+            lastError = error
+            log("❌ 恢复内置备份失败：\(error)")
+        } else {
+            log("已恢复内置备份，正在重签名微信…")
             resignWeChat()
         }
         refresh()

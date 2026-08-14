@@ -65,6 +65,11 @@ struct BannerModel: Equatable {
     var fix: FixAction? = nil
 }
 
+/// 卡片自定义图标（SF Symbol 之外的真实图标）。
+enum CardIcon: Equatable {
+    case weChatApp   // 运行时取 /Applications/WeChat.app 的真实图标
+}
+
 /// 摘要卡片展示模型。
 struct StatusCardModel: Identifiable, Equatable {
     let id: String
@@ -73,12 +78,15 @@ struct StatusCardModel: Identifiable, Equatable {
     let detail: String
     let symbol: String
     let tone: StatusTone
+    var customIcon: CardIcon? = nil
+    /// 图标在无警告/错误时用微信绿 accent（默认跟随 tone）。
+    var iconUsesAccent: Bool = false
 }
 
 // MARK: - 弹窗状态（单一枚举驱动，避免同时弹出多个对话框）
 
 enum ActiveDialog: String, Identifiable {
-    case migrateConfirm, restoreConfirm, backupConfirm
+    case migrateConfirm, restoreConfirm, backupRestoreConfirm, backupConfirm
     case existingTarget, cleanExternal
     case error, notice
     var id: String { rawValue }

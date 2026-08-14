@@ -53,13 +53,25 @@ struct ActionSection: View {
     }
 }
 
-/// 管理行：本地备份 / 外置数据清理入口（带占用大小，均二次确认）。
+/// 管理行：恢复内置备份 / 本地备份 / 外置数据清理入口（均二次确认）。
 struct ManageSection: View {
     @EnvironmentObject var vm: AppViewModel
 
     var body: some View {
-        if !vm.backupItems.isEmpty || vm.hasExternalData {
+        if !vm.restorableBackupItems.isEmpty || !vm.backupItems.isEmpty || vm.hasExternalData {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
+                if !vm.restorableBackupItems.isEmpty {
+                    HStack(spacing: DesignTokens.Spacing.xs) {
+                        Image(systemName: "arrow.uturn.backward.circle")
+                            .foregroundStyle(.secondary)
+                        Text("内置备份可恢复（放弃迁移，回到 Mac 上的旧数据）")
+                            .font(.callout)
+                        Spacer()
+                        Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
+                            .controlSize(.small)
+                            .disabled(!vm.canRestoreBackups)
+                    }
+                }
                 if !vm.backupItems.isEmpty {
                     HStack(spacing: DesignTokens.Spacing.xs) {
                         Image(systemName: "internaldrive")
@@ -77,13 +89,17 @@ struct ManageSection: View {
                     HStack(spacing: DesignTokens.Spacing.xs) {
                         Image(systemName: "externaldrive")
                             .foregroundStyle(.secondary)
-                        Text("外置数据占用 \(vm.externalDataSize.map(DiskProbe.formatBytes) ?? "统计中…")")
+                        Text("外置数据占用 \(vm.externalDataSize.map(DiskProbe.formatBytes) ?? "统计中…")"
+                             + (vm.canCleanExternalData || vm.isBusy ? "" : " · 还原到 Mac 后可清理"))
                             .font(.callout)
                             .monospacedDigit()
                         Spacer()
                         Button("清理外置数据…") { vm.requestCleanExternalData() }
                             .controlSize(.small)
                             .disabled(!vm.canCleanExternalData)
+                            .help(vm.canCleanExternalData
+                                  ? "删除外置硬盘上的 WeChatData"
+                                  : "还原到 Mac 后可清理")
                     }
                 }
             }
