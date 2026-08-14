@@ -47,6 +47,12 @@ enum DiskProbe {
         return type == .typeSymbolicLink
     }
 
+    /// 路径所在卷的卷名（仅 UI 展示用，只读）。
+    static func volumeName(path: String) -> String? {
+        try? URL(fileURLWithPath: path)
+            .resourceValues(forKeys: [.volumeNameKey]).volumeName
+    }
+
     /// 格式化字节数为可读字符串。
     static func formatBytes(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)

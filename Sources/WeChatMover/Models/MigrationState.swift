@@ -57,35 +57,44 @@ final class AppViewModel: ObservableObject {
     @Published var logs: [String] = []
     @Published var isBusy = false
     @Published var progress: Double = 0
-    @Published var showGuide = false
-    @Published var showMigrateSheet = false
-    @Published var showNonAPFSAlert = false
-    @Published var lastError: String? = nil
+    @Published var lastError: String? = nil {
+        didSet { if lastError != nil { activeDialog = .error } }
+    }
     /// 首次/刷新探测进行中：UI 显示"加载中…"占位，避免把默认值误显示成"未安装"。
     @Published var isLoading = false
     /// 数据大小递归枚举（可能分钟级）是否已完成；未完成时大小字段显示"统计中…"。
     @Published var sizesLoaded = false
     @Published var homeFreeSpace: Int64? = nil
-    @Published var showBackupConfirm = false
-    @Published var showQuitWeChatConfirm = false
     /// 正在等待微信退出（优雅退出 → 必要时强杀）。
     @Published var isQuittingWeChat = false
     /// 正在等待 codesign 重签名结果。
     @Published var isResigning = false
-    /// 重签名受阻：弹指引（App 管理授权 / 终端 sudo 兜底）。
-    @Published var showAppManagementGuide = false
-    /// 指引弹窗的触发原因（决定文案）。
+    /// 重签名受阻指引的触发原因（决定文案）。
     @Published var resignGuideReason: ResignGuideReason = .appManagementDenied
-    /// 迁移目标已存在数据：弹「删除旧数据并重新迁移 / 取消」确认框。
-    @Published var showExistingTargetConfirm = false
     /// 冲突的目标路径（仅供确认框文案与删除用）。
     @Published var conflictingTargetPath: String? = nil
-    /// 「清理外置数据」二次确认框。
-    @Published var showCleanExternalConfirm = false
     /// 外置 WeChatData 占用大小（refresh 慢速统计填充；nil = 未统计）。
     @Published var externalDataSize: Int64? = nil
     /// 中性提示弹窗（非失败，如"数据仍在使用中"）。
-    @Published var notice: String? = nil
+    @Published var notice: String? = nil {
+        didSet { if notice != nil { activeDialog = .notice } }
+    }
+
+    // MARK: - 展示层状态（单一状态源驱动 UI）
+
+    /// 弹窗（Alert/confirmationDialog）单一枚举驱动。
+    @Published var activeDialog: ActiveDialog? = nil
+    /// 弹层（Sheet）单一枚举驱动。
+    @Published var activeSheet: ActiveSheet? = nil
+    /// 进行中的操作种类（nil = 空闲）。
+    @Published var busyKind: BusyKind? = nil
+    /// 最近一次迁移的结果（驱动成功/失败横幅，「完成」或新操作清除）。
+    @Published var migrationOutcome: MigrationOutcome? = nil
+
+    // 兼容既有测试的只读映射（弹窗语义不变）。
+    var showExistingTargetConfirm: Bool { activeDialog == .existingTarget }
+    var showCleanExternalConfirm: Bool { activeDialog == .cleanExternal }
+    var showAppManagementGuide: Bool { activeSheet == .appManagementGuide }
 
     /// 运行状态探测（测试可注入假实现）。
     var isWeChatRunning: () -> Bool = WeChatDetector.isRunning
@@ -166,6 +175,253 @@ final class AppViewModel: ObservableObject {
 
     var canCleanExternalData: Bool {
         hasExternalData && !isBusy
+    }
+
+    // MARK: - 展示模型（状态 → 横幅/卡片，纯映射，可单测）
+
+    /// 目标磁盘显示名（卷名，取不到用文件夹名）。
+    var destinationName: String {
+        guard let base = targetBase else { return "" }
+        return DiskProbe.volumeName(path: base.path) ?? base.lastPathComponent
+    }
+
+    /// 主按钮文案：已有部分数据外置时为「更新迁移」。
+    var primaryActionTitle: String {
+        migratedItems.isEmpty ? "迁移到外置硬盘" : "更新迁移"
+    }
+
+    /// 安全检查待处理项（安全卡片与安全详情共用）。
+    var safetyIssues: [String] {
+        var issues: [String] = []
+        if !wechat.isInstalled { issues.append("未检测到微信") }
+        if wechat.isAppStoreVersion { issues.append("App Store 版微信不受支持") }
+        if !containerReadable { issues.append("需要完全磁盘访问权限") }
+        if !interruptedItems.isEmpty { issues.append("存在迁移中断残留") }
+        if wechat.signatureValid == false { issues.append("应用签名已失效") }
+        if wechatVersionChanged { issues.append("微信已更新，需要重新签名") }
+        return issues
+    }
+
+    /// 单一状态源。
+    var appStatus: AppStatus {
+        if isQuittingWeChat { return .busy(.quittingWeChat, progress: nil) }
+        if isResigning { return .busy(.resigning, progress: nil) }
+        if let busyKind {
+            return .busy(busyKind, progress: busyKind == .migrating ? progress : nil)
+        }
+        if let migrationOutcome {
+            switch migrationOutcome {
+            case .succeeded(let items, let bytes):
+                return .succeeded(
+                    "已迁移 \(items) 项数据（共 \(DiskProbe.formatBytes(bytes))）到 \(destinationName)。"
+                    + "打开微信确认正常后，可在下方清理本地备份释放空间。")
+            case .failed(let message):
+                return .failed(message)
+            }
+        }
+        if isLoading { return .checking }
+        guard wechat.isInstalled else { return .blocked(.notInstalled) }
+        guard !wechat.isAppStoreVersion else { return .blocked(.appStoreVersion) }
+        guard containerReadable else { return .blocked(.containerUnreadable) }
+        guard interruptedItems.isEmpty else { return .blocked(.interruptedResidue) }
+        guard brokenItems.isEmpty else { return .blocked(.diskDisconnected) }
+        guard targetBase != nil else { return .blocked(.noDestination) }
+        guard isTargetAPFS else {
+            return .blocked(.destinationNotAPFS(targetFSType ?? "未知"))
+        }
+        if sizesLoaded, !localItems.isEmpty,
+           let free = targetFreeSpace, free < totalLocalSize {
+            return .blocked(.insufficientSpace(need: totalLocalSize, free: free))
+        }
+        if localItems.isEmpty, !migratedItems.isEmpty { return .externalized }
+        return .ready
+    }
+
+    /// 就绪状态横幅展示模型。
+    var banner: BannerModel {
+        switch appStatus {
+        case .checking:
+            return BannerModel(
+                tone: .neutral, symbol: "magnifyingglass",
+                title: "正在检查环境…",
+                message: "正在检测微信安装状态、数据目录与目标磁盘。")
+        case .ready:
+            return BannerModel(
+                tone: .success, symbol: "checkmark.circle.fill",
+                title: "可以开始迁移",
+                message: "目标磁盘空间充足，安全检查已通过。将迁移 \(localItems.count) 项数据，共 \(DiskProbe.formatBytes(totalLocalSize))。")
+        case .externalized:
+            return BannerModel(
+                tone: .success, symbol: "checkmark.seal.fill",
+                title: "微信数据已在外置硬盘",
+                message: "全部数据已迁移到 \(destinationName)。外置盘未连接时请不要打开微信。")
+        case .blocked(let blocker):
+            return Self.bannerForBlocker(blocker)
+        case .busy(let kind, let value):
+            return Self.bannerForBusy(kind, progress: value)
+        case .succeeded(let summary):
+            return BannerModel(
+                tone: .success, symbol: "checkmark.seal.fill",
+                title: "迁移完成", message: summary)
+        case .failed(let message):
+            return BannerModel(
+                tone: .danger, symbol: "xmark.octagon.fill",
+                title: "迁移未完成", message: message, fix: .retryMigration)
+        }
+    }
+
+    private static func bannerForBlocker(_ blocker: Blocker) -> BannerModel {
+        switch blocker {
+        case .notInstalled:
+            return BannerModel(
+                tone: .danger, symbol: "xmark.octagon.fill",
+                title: "未检测到微信",
+                message: "请先安装微信官网下载版，再使用本工具迁移数据。",
+                fix: .openOfficialDownload)
+        case .appStoreVersion:
+            return BannerModel(
+                tone: .danger, symbol: "xmark.octagon.fill",
+                title: "暂不支持 App Store 版微信",
+                message: "App Store 版受沙盒限制，迁移后软链会失效。请从官网下载 DMG 版覆盖安装。",
+                fix: .openOfficialDownload)
+        case .containerUnreadable:
+            return BannerModel(
+                tone: .warning, symbol: "lock.shield",
+                title: "需要访问微信数据",
+                message: "请在 系统设置 → 隐私与安全性 → 完全磁盘访问权限 中允许 WeChatMover，然后重启本 App。",
+                fix: .openFullDiskAccess)
+        case .interruptedResidue:
+            return BannerModel(
+                tone: .warning, symbol: "exclamationmark.triangle.fill",
+                title: "检测到迁移中断残留",
+                message: "上次迁移中途失败留下了 _backup 目录。请手工检查（一般把 _backup 改名回原名即可恢复）后再操作。")
+        case .diskDisconnected:
+            return BannerModel(
+                tone: .warning, symbol: "exclamationmark.triangle.fill",
+                title: "外置硬盘未连接",
+                message: "迁移目标不可达。请先连接硬盘再打开微信，否则微信会在 Mac 上新建空数据目录。")
+        case .noDestination:
+            return BannerModel(
+                tone: .info, symbol: "externaldrive",
+                title: "选择目标位置",
+                message: "在外置硬盘上选择一个文件夹，用于存放迁移后的微信数据。",
+                fix: .chooseDestination)
+        case .destinationNotAPFS(let fs):
+            return BannerModel(
+                tone: .warning, symbol: "exclamationmark.triangle.fill",
+                title: "目标磁盘格式不受支持",
+                message: "当前格式为 \(fs)，该磁盘格式不受支持，请选择 APFS 格式的磁盘。",
+                fix: .chooseDestination)
+        case .insufficientSpace(let need, let free):
+            return BannerModel(
+                tone: .warning, symbol: "exclamationmark.triangle.fill",
+                title: "目标磁盘空间不足",
+                message: "至少需要 \(DiskProbe.formatBytes(need))，当前可用 \(DiskProbe.formatBytes(free))。",
+                fix: .chooseDestination)
+        }
+    }
+
+    private static func bannerForBusy(_ kind: BusyKind, progress: Double?) -> BannerModel {
+        switch kind {
+        case .migrating:
+            let percent = Int(((progress ?? 0) * 100).rounded())
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在迁移… \(percent)%",
+                message: "迁移期间请不要退出微信或拔出硬盘。",
+                progress: progress)
+        case .restoring:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在还原到 Mac…",
+                message: "还原期间请不要打开微信或拔出硬盘。")
+        case .deletingBackups:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在清理本地备份…",
+                message: "正在逐项确认软链有效后删除备份。")
+        case .sizingExternal:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在统计外置数据大小…",
+                message: "大目录可能需要一些时间。")
+        case .cleaningExternal:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在清理外置数据…",
+                message: "删除期间请不要拔出硬盘。")
+        case .quittingWeChat:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在退出微信…",
+                message: "优先优雅退出，几秒后未退出会强制结束。")
+        case .resigning:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在重签名微信…",
+                message: "首次需要在「App 管理」中授权 WeChatMover。")
+        }
+    }
+
+    /// 三张摘要卡片。
+    var summaryCards: [StatusCardModel] {
+        [dataCard, destinationCard, safetyCard]
+    }
+
+    private var dataCard: StatusCardModel {
+        let value = sizesLoaded ? DiskProbe.formatBytes(totalDataSize) : "统计中…"
+        let detail: String
+        let symbol: String
+        let tone: StatusTone
+        if !brokenItems.isEmpty {
+            detail = "已外置 · 硬盘未连接"; symbol = "externaldrive"; tone = .warning
+        } else if !migratedItems.isEmpty {
+            detail = backupItems.isEmpty ? "已外置" : "已外置 · 本地备份待清理"
+            symbol = "externaldrive"; tone = .success
+        } else {
+            detail = "位于 Mac"; symbol = "internaldrive"; tone = .neutral
+        }
+        return StatusCardModel(id: "data", title: "微信数据", value: value,
+                               detail: detail, symbol: symbol, tone: tone)
+    }
+
+    private var destinationCard: StatusCardModel {
+        guard targetBase != nil else {
+            return StatusCardModel(id: "destination", title: "目标磁盘", value: "未选择",
+                                   detail: "选择一个外置硬盘文件夹",
+                                   symbol: "externaldrive", tone: .neutral)
+        }
+        let value = targetFreeSpace.map { DiskProbe.formatBytes($0) + " 可用" } ?? "—"
+        let detail = "\(destinationName) · \(targetFSType ?? "未知格式")"
+        var tone: StatusTone = .neutral
+        if !isTargetAPFS { tone = .warning }
+        if sizesLoaded, !localItems.isEmpty,
+           let free = targetFreeSpace, free < totalLocalSize { tone = .warning }
+        return StatusCardModel(id: "destination", title: "目标磁盘", value: value,
+                               detail: detail, symbol: "externaldrive.fill", tone: tone)
+    }
+
+    private var safetyCard: StatusCardModel {
+        let issues = safetyIssues
+        let value = isLoading ? "检查中…" : (issues.isEmpty ? "全部通过" : "\(issues.count) 项待处理")
+        let signature: String
+        switch wechat.signatureValid {
+        case .some(true): signature = "应用签名有效"
+        case .some(false): signature = "应用签名已失效"
+        case .none: signature = "签名未检测"
+        }
+        let detail = "微信 \(wechat.version ?? "—") · \(signature)"
+        return StatusCardModel(
+            id: "safety", title: "安全检查", value: value, detail: detail,
+            symbol: issues.isEmpty ? "checkmark.shield" : "exclamationmark.shield",
+            tone: issues.isEmpty ? .success : .warning)
+    }
+
+    /// 迁移确认框摘要（规范 6.3：数据大小、目标路径、提醒）。
+    var migrateConfirmMessage: String {
+        let names = localItems.map { Copywriting.itemName($0.subdir) }.joined(separator: "、")
+        return "将迁移 \(names)（共 \(DiskProbe.formatBytes(totalLocalSize))）到 \(targetBase?.path ?? "")。\n\n"
+            + "微信将先退出；迁移期间请不要拔出硬盘。"
     }
 
     // MARK: - 刷新（渐进式并行加载）
@@ -332,37 +588,36 @@ final class AppViewModel: ObservableObject {
     func applyTargetSelection(_ url: URL) {
         targetBase = url
         UserDefaults.standard.set(url.path, forKey: DefaultsKey.targetBasePath)
+        migrationOutcome = nil
         refreshTargetInfo()
         log("已选择目标位置：\(url.path)")
         if let fs = targetFSType {
             log("目标卷格式：\(fs)，剩余：\(DiskProbe.formatBytes(targetFreeSpace ?? 0))")
-            if !DiskProbe.isAPFS(fsTypeName: fs) { showNonAPFSAlert = true }
         }
     }
 
     // MARK: - 迁移 / 还原
 
-    /// 「一键迁移」按钮入口：微信正在运行时先弹确认框引导退出，否则直接进迁移确认页。
+    /// 主按钮入口：弹迁移确认框（微信运行中也可点，确认后会先退出微信）。
     func requestMigration() {
         guard canMigrate else { return }
-        // 刷新一次运行状态，避免上次探测后用户又打开了微信。
-        wechat.isRunning = isWeChatRunning()
-        if wechat.isRunning {
-            showQuitWeChatConfirm = true
-        } else {
-            showMigrateSheet = true
-        }
+        activeDialog = .migrateConfirm
     }
 
-    /// 确认框「退出微信并继续」：优雅退出 → 等几秒 → 必要时强杀，成功后进迁移确认页。
-    func quitWeChatAndContinue() {
+    /// 确认框「退出微信并开始迁移」：运行中先优雅退出（必要时强杀），成功后直接开始迁移。
+    func confirmMigration() {
         // AppleScript quit 可能触发「自动化」权限弹窗，先激活 App。
         activateApp()
-        isQuittingWeChat = true
-        log("正在退出微信…")
-        Task.detached { [weak self] in
-            let quit = await WeChatQuitter.ensureQuit()
-            await self?.quitWeChatFinished(quit)
+        wechat.isRunning = isWeChatRunning()
+        if wechat.isRunning {
+            isQuittingWeChat = true
+            log("正在退出微信…")
+            Task.detached { [weak self] in
+                let quit = await WeChatQuitter.ensureQuit()
+                await self?.quitWeChatFinished(quit)
+            }
+        } else {
+            startMigration()
         }
     }
 
@@ -371,7 +626,7 @@ final class AppViewModel: ObservableObject {
         wechat.isRunning = isWeChatRunning()
         if quit && !wechat.isRunning {
             log("✅ 微信已退出")
-            showMigrateSheet = true
+            startMigration()
         } else {
             lastError = "无法退出微信，请手动退出后重试。"
             log("❌ 退出微信失败")
@@ -380,7 +635,7 @@ final class AppViewModel: ObservableObject {
 
     func startMigration() {
         guard let base = targetBase else { return }
-        // 兜底：确认页打开期间微信又被启动，拒绝迁移。
+        // 兜底：确认框打开期间微信又被启动，拒绝迁移。
         wechat.isRunning = isWeChatRunning()
         guard !wechat.isRunning else {
             lastError = "微信正在运行，请先退出微信再迁移。"
@@ -389,6 +644,8 @@ final class AppViewModel: ObservableObject {
         }
         let todo = localItems
         isBusy = true
+        busyKind = .migrating
+        migrationOutcome = nil
         progress = 0
         log("开始迁移 \(todo.count) 个目录，共 \(DiskProbe.formatBytes(totalLocalSize)) …")
 
@@ -428,22 +685,24 @@ final class AppViewModel: ObservableObject {
 
     private func migrationFinished(error: (any Error)?) {
         isBusy = false
+        busyKind = nil
         progress = 1
         if let error {
             if case MigrationError.targetAlreadyExists(let path) = error {
                 // 目标已存在：可能来自上次迁移中断或重复迁移，
                 // 不直接判失败，弹确认框让用户选择删除旧数据后重新迁移。
                 conflictingTargetPath = path
-                showExistingTargetConfirm = true
+                activeDialog = .existingTarget
                 log("⚠️ 目标位置已有数据，可能来自上次迁移中断或重复迁移：\(path)")
             } else {
-                lastError = error.localizedDescription
+                migrationOutcome = .failed(error.localizedDescription)
                 log("❌ 迁移失败：\(error.localizedDescription)")
             }
         } else {
+            migrationOutcome = .succeeded(items: localItems.count, bytes: totalLocalSize)
             log("全部迁移完成，正在重签名微信…")
             resignWeChat()
-            showGuide = true
+            activeSheet = .guide
         }
         refresh()
     }
@@ -487,6 +746,8 @@ final class AppViewModel: ObservableObject {
         guard let base = targetBase else { return }
         let todo = migratedItems
         isBusy = true
+        busyKind = .restoring
+        migrationOutcome = nil
         progress = 0
         log("开始还原 \(todo.count) 个目录 …")
         Task.detached { [weak self] in
@@ -506,6 +767,7 @@ final class AppViewModel: ObservableObject {
 
     private func restoreFinished(error: String?) {
         isBusy = false
+        busyKind = nil
         progress = 1
         if let error {
             lastError = error
@@ -524,7 +786,7 @@ final class AppViewModel: ObservableObject {
         activateApp()
         guard isAppBundleWritable() else {
             resignGuideReason = .notWritable
-            showAppManagementGuide = true
+            activeSheet = .appManagementGuide
             log("⚠️ \(CodeSigner.wechatAppPath) 当前用户不可写，请按指引在终端执行 sudo 命令")
             return
         }
@@ -556,7 +818,7 @@ final class AppViewModel: ObservableObject {
             // TCC「App 管理」权限缺失：弹授权指引（含终端兜底命令）。
             resignGuideReason = .appManagementDenied
             log("⚠️ 重签名被系统拒绝：缺少「App 管理」权限（\(detail)）")
-            showAppManagementGuide = true
+            activeSheet = .appManagementGuide
             refresh()
         case .failed(let message):
             log("⚠️ 重签名未完成：\(message)")
@@ -580,6 +842,8 @@ final class AppViewModel: ObservableObject {
         let todo = backupItems
         guard !todo.isEmpty else { return }
         isBusy = true
+        busyKind = .deletingBackups
+        migrationOutcome = nil
         log("开始删除 \(todo.count) 个本地备份 …")
         Task.detached { [weak self] in
             var freed: Int64 = 0
@@ -598,6 +862,7 @@ final class AppViewModel: ObservableObject {
 
     private func deleteBackupsFinished(freed: Int64, failures: [String]) {
         isBusy = false
+        busyKind = nil
         log("备份清理完成，释放空间 \(DiskProbe.formatBytes(freed))")
         for failure in failures {
             log("⚠️ 跳过：\(failure)")
@@ -647,6 +912,7 @@ final class AppViewModel: ObservableObject {
             return
         }
         isBusy = true
+        busyKind = .sizingExternal
         log("正在统计外置数据大小…")
         Task.detached { [weak self] in
             let size = DiskProbe.directorySize(at: root)
@@ -656,8 +922,9 @@ final class AppViewModel: ObservableObject {
 
     private func externalDataSized(_ size: Int64) {
         isBusy = false
+        busyKind = nil
         externalDataSize = size
-        showCleanExternalConfirm = true
+        activeDialog = .cleanExternal
     }
 
     /// 二次确认「删除」后执行。
@@ -671,6 +938,8 @@ final class AppViewModel: ObservableObject {
             return
         }
         isBusy = true
+        busyKind = .cleaningExternal
+        migrationOutcome = nil
         log("正在删除外置数据：\(root.path) …")
         Task.detached { [weak self] in
             var failed: String? = nil
@@ -685,6 +954,7 @@ final class AppViewModel: ObservableObject {
 
     private func cleanExternalDataFinished(error: String?) {
         isBusy = false
+        busyKind = nil
         if let error {
             lastError = "删除外置数据失败：\(error)"
             log("❌ 删除外置数据失败：\(error)")
@@ -693,6 +963,64 @@ final class AppViewModel: ObservableObject {
             externalDataSize = nil
         }
         refresh()
+    }
+
+    // MARK: - 日志与结果动作
+
+    func copyLogs() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(logs.joined(separator: "\n"), forType: .string)
+        log("日志已复制到剪贴板")
+    }
+
+    func clearLogs() {
+        logs.removeAll()
+    }
+
+    /// 导出日志到文件（NSSavePanel 同属系统面板，先激活 App）。
+    func exportLogs() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "WeChatMover-日志.txt"
+        activateApp()
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try self.logs.joined(separator: "\n")
+                        .write(to: url, atomically: true, encoding: .utf8)
+                    self.log("日志已导出：\(url.path)")
+                } catch {
+                    self.lastError = "导出日志失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    /// 成功横幅「在 Finder 中显示」。
+    func revealExternalData() {
+        guard let root = externalDataURL,
+              FileManager.default.fileExists(atPath: root.path) else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([root])
+    }
+
+    /// 成功横幅「复制报告」。
+    func copyMigrationReport() {
+        var lines: [String] = ["WeChatMover 迁移报告"]
+        if case .succeeded(let summary) = appStatus {
+            lines.append(summary)
+        }
+        lines.append("目标位置：\(targetBase?.path ?? "—")")
+        lines.append("")
+        lines.append(contentsOf: logs)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+        log("迁移报告已复制到剪贴板")
+    }
+
+    /// 成功横幅「完成」：清除结果横幅，回到常规状态。
+    func dismissOutcome() {
+        migrationOutcome = nil
     }
 
     private func setProgress(_ value: Double) {

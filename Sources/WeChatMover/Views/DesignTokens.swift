@@ -1,0 +1,82 @@
+import SwiftUI
+import AppKit
+
+/// 设计规范第 4 节：颜色 / 字体 / 间距 / 圆角集中管理，全部动态适配深浅色。
+enum DesignTokens {
+    enum Spacing {
+        static let xxs: CGFloat = 4
+        static let xs: CGFloat = 8
+        static let sm: CGFloat = 12
+        static let md: CGFloat = 16
+        static let lg: CGFloat = 20
+        static let xl: CGFloat = 24
+        static let xxl: CGFloat = 32
+    }
+
+    enum Radius {
+        static let card: CGFloat = 12
+        static let control: CGFloat = 8
+        static let pill: CGFloat = 999
+    }
+
+    enum Colors {
+        static let background = Color(nsColor: .windowBackgroundColor)
+        static let surface = Color(nsColor: .controlBackgroundColor)
+        static let surfaceSubtle = Color(nsColor: .quaternaryLabelColor).opacity(0.2)
+        static let separator = Color(nsColor: .separatorColor)
+        /// 微信绿：浅色 #07C160 / 深色 #20CD71
+        static let accent = Color.dynamic(light: 0x07C160, dark: 0x20CD71)
+        static let warning = Color.orange
+        static let danger = Color.red
+        static let info = Color.blue
+    }
+
+    /// 状态色调 → 颜色（不单独依赖颜色表达状态，配合 SF Symbol + 文案使用）。
+    static func toneColor(_ tone: StatusTone) -> Color {
+        switch tone {
+        case .neutral: return .secondary
+        case .info: return Colors.info
+        case .success: return Colors.accent
+        case .warning: return Colors.warning
+        case .danger: return Colors.danger
+        }
+    }
+
+    /// 卡片容器修饰：surface 底 + 1px separator 描边 + 12 圆角，无阴影。
+    struct Card: ViewModifier {
+        func body(content: Content) -> some View {
+            content
+                .padding(Spacing.md)
+                .background(Colors.surface, in: RoundedRectangle(cornerRadius: Radius.card))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Radius.card)
+                        .stroke(Colors.separator, lineWidth: 1)
+                )
+        }
+    }
+}
+
+extension View {
+    func cardStyle() -> some View { modifier(DesignTokens.Card()) }
+}
+
+extension Color {
+    /// 深浅色双值动态颜色。
+    static func dynamic(light: UInt32, dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            return NSColor(hex: isDark ? dark : light)
+        })
+    }
+}
+
+extension NSColor {
+    convenience init(hex: UInt32) {
+        self.init(
+            srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+}

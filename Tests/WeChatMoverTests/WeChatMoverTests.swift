@@ -814,3 +814,125 @@ private func makeSignableFixtureApp(root: URL) throws -> URL {
     #expect(vm.lastError == nil)
     #expect(vm.logs.contains { $0.contains("释放空间") })
 }
+
+// MARK: - 展示层映射（AppStatus → 横幅/卡片，纯展示逻辑）
+
+@MainActor
+private func makePresentationVM() -> AppViewModel {
+    let vm = AppViewModel()
+    vm.wechat.isInstalled = true
+    vm.containerReadable = true
+    vm.sizesLoaded = true
+    vm.targetBase = URL(fileURLWithPath: "/Volumes/Ext/test", isDirectory: true)
+    vm.targetFSType = "apfs"
+    vm.targetFreeSpace = 1_000_000_000
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/c/Documents/xwechat_files"),
+                           state: .local, size: 100_000_000,
+                           hasBackup: false, backupSize: 0)]
+    return vm
+}
+
+@MainActor @Test func bannerReady() {
+    let vm = makePresentationVM()
+    #expect(vm.appStatus == .ready)
+    #expect(vm.banner.tone == .success)
+    #expect(vm.banner.title == "可以开始迁移")
+    #expect(vm.primaryActionTitle == "迁移到外置硬盘")
+    // 三张摘要卡片：数据 / 目标磁盘 / 安全检查
+    #expect(vm.summaryCards.map(\.id) == ["data", "destination", "safety"])
+    #expect(vm.summaryCards[2].value == "全部通过")
+}
+
+@MainActor @Test func bannerBlockedReasons() {
+    // 未选目标
+    let noDest = AppViewModel()
+    noDest.wechat.isInstalled = true
+    noDest.items = makePresentationVM().items
+    #expect(noDest.appStatus == .blocked(.noDestination))
+    #expect(noDest.banner.fix == .chooseDestination)
+
+    // 无容器权限（优先级高于未选目标）
+    let noPerm = makePresentationVM()
+    noPerm.containerReadable = false
+    #expect(noPerm.appStatus == .blocked(.containerUnreadable))
+    #expect(noPerm.banner.fix == .openFullDiskAccess)
+
+    // 非 APFS
+    let exfat = makePresentationVM()
+    exfat.targetFSType = "exfat"
+    #expect(exfat.appStatus == .blocked(.destinationNotAPFS("exfat")))
+    #expect(exfat.banner.message.contains("APFS"))
+
+    // 空间不足
+    let tight = makePresentationVM()
+    tight.targetFreeSpace = 50_000_000
+    #expect(tight.appStatus == .blocked(.insufficientSpace(need: 100_000_000, free: 50_000_000)))
+    #expect(tight.banner.title == "目标磁盘空间不足")
+
+    // App Store 版
+    let mas = makePresentationVM()
+    mas.wechat.isAppStoreVersion = true
+    #expect(mas.appStatus == .blocked(.appStoreVersion))
+    #expect(mas.banner.fix == .openOfficialDownload)
+}
+
+@MainActor @Test func bannerExternalized() {
+    let vm = makePresentationVM()
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/c/Documents/xwechat_files"),
+                           state: .migrated, size: 100_000_000,
+                           hasBackup: false, backupSize: 0)]
+    #expect(vm.appStatus == .externalized)
+    #expect(vm.banner.tone == .success)
+    #expect(vm.banner.title == "微信数据已在外置硬盘")
+    #expect(vm.primaryActionTitle == "更新迁移")   // 有部分外置时主按钮文案
+}
+
+@MainActor @Test func bannerBusyAndOutcome() {
+    let vm = makePresentationVM()
+    // 迁移中：横幅带真实字节进度
+    vm.busyKind = .migrating
+    vm.progress = 0.42
+    #expect(vm.appStatus == .busy(.migrating, progress: 0.42))
+    #expect(vm.banner.title == "正在迁移… 42%")
+    #expect(vm.banner.progress == 0.42)
+
+    // 成功
+    vm.busyKind = nil
+    vm.migrationOutcome = .succeeded(items: 1, bytes: 100_000_000)
+    guard case .succeeded = vm.appStatus else {
+        Issue.record("应为 succeeded"); return
+    }
+    #expect(vm.banner.tone == .success)
+    #expect(vm.banner.title == "迁移完成")
+
+    // 失败：横幅给出重试动作，不走泛化错误弹窗
+    vm.migrationOutcome = .failed("目标硬盘已断开")
+    #expect(vm.appStatus == .failed("目标硬盘已断开"))
+    #expect(vm.banner.tone == .danger)
+    #expect(vm.banner.fix == .retryMigration)
+}
+
+// MARK: - 文案与日志展示映射
+
+@Test func copywritingHumanNames() {
+    #expect(Copywriting.itemName("Documents/xwechat_files") == "微信聊天文件")
+    #expect(Copywriting.itemName("Documents/app_data") == "微信应用数据")
+    #expect(Copywriting.itemName("Library/Application Support/com.tencent.xinWeChat") == "微信兼容数据")
+    #expect(Copywriting.itemName("other") == "other")
+    #expect(Copywriting.sourceName(isAppStoreVersion: false) == "官网下载版")
+}
+
+@Test func logLineParsing() {
+    let ok = LogPresentation.parse("[13:49:07] ✅ 已迁移：xwechat_files")
+    #expect(ok.tone == .success)
+    #expect(ok.symbol == "checkmark.circle.fill")
+    #expect(!ok.text.contains("✅"))
+
+    #expect(LogPresentation.parse("[t] ⚠️ 跳过").tone == .warning)
+    #expect(LogPresentation.parse("[t] ❌ 失败").tone == .danger)
+    let plain = LogPresentation.parse("[13:49:07] 开始迁移")
+    #expect(plain.tone == .neutral)
+    #expect(plain.text == "[13:49:07] 开始迁移")
+}
