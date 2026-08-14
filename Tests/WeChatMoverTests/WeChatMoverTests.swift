@@ -113,9 +113,9 @@ private func makeDataDir(root: URL, _ relative: String, fileSizes: [Int] = [100,
 // MARK: - 签名命令
 
 @Test func codesignCommand() {
+    #expect(CodeSigner.codesignArguments
+            == ["--sign", "-", "--force", "--deep", "/Applications/WeChat.app"])
     #expect(CodeSigner.shellCommand == "codesign --sign - --force --deep /Applications/WeChat.app")
-    #expect(CodeSigner.appleScriptSource.contains("with administrator privileges"))
-    #expect(CodeSigner.appleScriptSource.contains(CodeSigner.shellCommand))
 }
 
 // MARK: - App Store 版检测
@@ -399,7 +399,7 @@ func detectRealWeChat() {
     }
 }
 
-// MARK: - osascript 提权结果解析（纯逻辑）
+// MARK: - codesign 结果解析（纯逻辑）
 
 @Test func parseResignResultSuccess() {
     #expect(CodeSigner.parseResult(status: 0, stderr: "") == .success)
@@ -407,25 +407,13 @@ func detectRealWeChat() {
     #expect(CodeSigner.parseResult(status: 0, stderr: "noise") == .success)
 }
 
-@Test func parseResignResultCancelled() {
-    // osascript 提权弹窗「用户取消」的真实输出
-    let real = "31:76: execution error: User canceled. (-128)\n"
-    #expect(CodeSigner.parseResult(status: 1, stderr: real) == .cancelled)
-    #expect(CodeSigner.parseResult(status: 1, stderr: "User canceled") == .cancelled)
-    #expect(CodeSigner.parseResult(status: 1, stderr: "(-128)") == .cancelled)
-}
-
 @Test func parseResignResultFailure() {
     #expect(CodeSigner.parseResult(status: 1, stderr: "some error\n")
             == .failed("some error"))
     #expect(CodeSigner.parseResult(status: 3, stderr: "  \n") == .failed("退出码 3"))
-    // 取消不算失败
-    if case .failed = CodeSigner.parseResult(status: 1, stderr: "User canceled. (-128)") {
-        Issue.record("用户取消不应解析为失败")
-    }
 }
 
-// MARK: - 进程异步执行（用 /bin/sh fixture，不触碰提权路径）
+// MARK: - 进程异步执行（用 /bin/sh fixture）
 
 @Test func runProcessSuccess() async {
     let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
@@ -435,16 +423,6 @@ func detectRealWeChat() {
         ) { cont.resume(returning: $0) }
     }
     #expect(result == .success)
-}
-
-@Test func runProcessCancelledParsing() async {
-    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
-        CodeSigner.run(
-            executableURL: URL(fileURLWithPath: "/bin/sh"),
-            arguments: ["-c", "echo 'User canceled. (-128)' >&2; exit 1"]
-        ) { cont.resume(returning: $0) }
-    }
-    #expect(result == .cancelled)
 }
 
 @Test func runProcessFailure() async {
@@ -552,8 +530,6 @@ private final class QuitFixture: @unchecked Sendable {
     #expect(detail.contains("Operation not permitted"))
     // 不含 EPERM 的普通失败仍走 failed
     #expect(CodeSigner.parseResult(status: 1, stderr: "boom") == .failed("boom"))
-    // 取消优先级不变
-    #expect(CodeSigner.parseResult(status: 1, stderr: "User canceled. (-128)") == .cancelled)
 }
 
 @Test func terminalFallbackCommand() {
@@ -638,12 +614,75 @@ private func waitUntil(
 
 @MainActor @Test func resignAppManagementDeniedShowsGuide() async {
     let vm = AppViewModel()
+    vm.isAppBundleWritable = { true }
     vm.resignRunner = { completion in
         completion(.appManagementDenied("Operation not permitted"))
     }
     vm.resignWeChat()
     #expect(await waitUntil { vm.showAppManagementGuide })
+    #expect(vm.resignGuideReason == .appManagementDenied)
     #expect(!vm.isResigning)
     #expect(vm.lastError == nil)   // 不算普通失败，走专属指引
     #expect(vm.logs.contains { $0.contains("App 管理") })
+}
+
+@MainActor @Test func resignNotWritableShowsTerminalFallback() async {
+    let vm = AppViewModel()
+    var runnerCalled = false
+    vm.isAppBundleWritable = { false }   // 包所有者不是当前用户
+    vm.resignRunner = { _ in runnerCalled = true }
+    vm.resignWeChat()
+    // 直接弹终端 sudo 兜底指引，不启动 codesign
+    #expect(vm.showAppManagementGuide)
+    #expect(vm.resignGuideReason == .notWritable)
+    #expect(!vm.isResigning)
+    #expect(!runnerCalled)
+    #expect(vm.logs.contains { $0.contains("不可写") })
+}
+
+@MainActor @Test func resignSuccessVerifiesSignature() async {
+    let vm = AppViewModel()
+    vm.isAppBundleWritable = { true }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }   // 不扫真实 App
+    vm.resignWeChat()
+    #expect(await waitUntil { vm.wechat.signatureValid == true })
+    #expect(!vm.isResigning)
+    #expect(vm.logs.contains { $0.contains("签名有效") })
+}
+
+// MARK: - 真实 codesign 直签（只签临时目录 fixture，不碰真实微信）
+
+/// 造一个可签名的最小 .app（Info.plist + 主可执行文件）。
+private func makeSignableFixtureApp(root: URL) throws -> URL {
+    let contents = root.appendingPathComponent("Mini.app/Contents", isDirectory: true)
+    let macos = contents.appendingPathComponent("MacOS", isDirectory: true)
+    try FileManager.default.createDirectory(at: macos, withIntermediateDirectories: true)
+    try NSDictionary(dictionary: [
+        "CFBundleExecutable": "Mini",
+        "CFBundleIdentifier": "com.example.mini",
+        "CFBundleShortVersionString": "1.0",
+    ]).write(to: contents.appendingPathComponent("Info.plist"))
+    let exe = macos.appendingPathComponent("Mini")
+    try "#!/bin/sh\nexit 0\n".write(to: exe, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+    return root.appendingPathComponent("Mini.app")
+}
+
+/// 验证本次修复的核心前提：不提权直接 codesign ad-hoc 重签 + 复核通过。
+@Test func resignFixtureAppDirectly() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let app = try makeSignableFixtureApp(root: root)
+
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["--sign", "-", "--force", "--deep", app.path]
+        ) { cont.resume(returning: $0) }
+    }
+    #expect(result == .success)
+    #expect(WeChatDetector.checkSignature(appURL: app))   // codesign -v 复核通过
 }

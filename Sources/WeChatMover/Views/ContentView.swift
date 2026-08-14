@@ -154,7 +154,7 @@ struct ContentView: View {
             if vm.isResigning {
                 HStack {
                     ProgressView().controlSize(.small)
-                    Text("正在重签名微信，等待管理员授权…（请在系统密码框中输入密码）")
+                    Text("正在重签名微信…（首次需「App 管理」授权）")
                         .foregroundStyle(.secondary)
                 }
                 .font(.callout)

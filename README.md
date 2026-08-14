@@ -20,7 +20,9 @@
 
 迁移后数据实际位于 `<你选择的文件夹>/WeChatData/<子目录名>`，原位置是同名符号链接。
 
-迁移流程：后台拷贝 → 大小校验 → 源目录改名为 `<原名>_backup`（**不删除**）→ 建软链 → 确认软链可达。任何一步失败都会自动回滚，不会丢数据。迁移完成后用 `codesign --sign - --force --deep /Applications/WeChat.app` 重签名（通过 osascript 弹系统密码框提权），因为数据位置变化会破坏原签名校验。
+迁移流程：后台拷贝 → 大小校验 → 源目录改名为 `<原名>_backup`（**不删除**）→ 建软链 → 确认软链可达。任何一步失败都会自动回滚，不会丢数据。迁移完成后用 `codesign --sign - --force --deep /Applications/WeChat.app` 重签名并自动 `codesign -v` 复核，因为数据位置变化会破坏原签名校验。
+
+重签名**不需要管理员密码/ root**：拖拽安装的微信，`/Applications/WeChat.app` 所有者就是当前用户，直接签即可。真正需要的是 macOS Ventura+ 的 **「App 管理」权限**（修改其他 App 的包需显式授权）——所以本工具在进程内直接执行 codesign，让该权限归责到 WeChatMover 自身，按提示授权一次即可；不能借 osascript 提权签，那样权限会归责到系统中间进程，授权了也永远写不进去。
 
 ### 关于 `_backup` 备份
 
@@ -67,7 +69,7 @@ bash Scripts/test.sh
 2. 若提示无法读取微信数据目录，点击按钮跳转「完全磁盘访问权限」，授权后重启本 App。
 3. 点击「选择文件夹…」，在外置硬盘上任选一个文件夹作为目标位置；留意卷格式与剩余空间。
 4. 退出微信，点击「一键迁移…」，确认前置检查清单后开始。
-5. 迁移过程中系统会弹密码框（用于重签名微信），输入开机密码。
+5. 迁移完成后工具自动重签名微信并复核；首次可能弹「App 管理」授权指引，按提示授权一次即可（不需要输入密码）。
 6. 完成后按指引重新授权屏幕录制/麦克风权限。
 7. 打开微信确认一切正常后，回到本工具点击「删除备份…」释放内置盘空间。
 
@@ -77,7 +79,7 @@ bash Scripts/test.sh
 
 ### 重签名失败：Operation not permitted
 
-macOS Ventura 及以上有「App 管理」权限：修改其他 App 的包（含 codesign 重签名）必须显式授权，osascript 提权到 root 也绕不过。日志出现 `Operation not permitted` 时，工具会自动弹出指引：
+macOS Ventura 及以上有「App 管理」权限：修改其他 App 的包（含 codesign 重签名）必须显式授权。本工具直接执行 codesign（不弹密码框），权限归责到 WeChatMover 自身。日志出现 `Operation not permitted` 时，工具会自动弹出指引：
 
 1. 点指引里的按钮打开 系统设置 → 隐私与安全性 → **App 管理**，打开 WeChatMover 的开关（列表中没有就点「+」添加）；
 2. 回到工具点「重试重签名」。
@@ -104,7 +106,7 @@ Sources/WeChatMover/
 │   ├── WeChatDetector.swift   # 安装/版本/App Store 版/运行中/签名校验
 │   ├── DiskProbe.swift        # 卷格式(APFS)、剩余空间、目录大小
 │   ├── Migrator.swift         # 迁移/还原核心（拷贝→校验→源改名 _backup→建软链，带回滚）
-│   ├── CodeSigner.swift       # codesign + osascript 提权
+│   ├── CodeSigner.swift       # codesign 直签（不提权）+ 结果分类/复核
 │   └── PermissionHelper.swift # TCC 检测与系统设置深链
 └── Views/                     # SwiftUI 界面（简体中文）
 Scripts/

@@ -40,6 +40,12 @@ enum DefaultsKey {
     static let lastSignedVersion = "lastSignedVersion"
 }
 
+/// 重签名指引弹窗的触发原因（决定指引文案）。
+enum ResignGuideReason {
+    case appManagementDenied   // TCC「App 管理」未授权（codesign EPERM）
+    case notWritable           // /Applications/WeChat.app 当前用户不可写，走终端 sudo 兜底
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var wechat = WeChatInfo()
@@ -64,10 +70,12 @@ final class AppViewModel: ObservableObject {
     @Published var showQuitWeChatConfirm = false
     /// 正在等待微信退出（优雅退出 → 必要时强杀）。
     @Published var isQuittingWeChat = false
-    /// 正在等待 osascript 提权密码框的结果（重签名进行中）。
+    /// 正在等待 codesign 重签名结果。
     @Published var isResigning = false
-    /// 重签名被 TCC「App 管理」权限拒绝：弹授权指引。
+    /// 重签名受阻：弹指引（App 管理授权 / 终端 sudo 兜底）。
     @Published var showAppManagementGuide = false
+    /// 指引弹窗的触发原因（决定文案）。
+    @Published var resignGuideReason: ResignGuideReason = .appManagementDenied
     /// 迁移目标已存在数据：弹「删除旧数据并重新迁移 / 取消」确认框。
     @Published var showExistingTargetConfirm = false
     /// 冲突的目标路径（仅供确认框文案与删除用）。
@@ -75,9 +83,13 @@ final class AppViewModel: ObservableObject {
 
     /// 运行状态探测（测试可注入假实现）。
     var isWeChatRunning: () -> Bool = WeChatDetector.isRunning
-    /// 实际执行重签名的闭包（测试可注入假实现，避免弹真实密码框）。
+    /// 实际执行重签名的闭包（测试可注入假实现）。
     var resignRunner: (@escaping @Sendable (CodeSigner.ResignResult) -> Void) -> Void =
         CodeSigner.resignWeChat
+    /// /Applications/WeChat.app 可写性探测（测试可注入假实现）。
+    var isAppBundleWritable: () -> Bool = { CodeSigner.isWritableByCurrentUser() }
+    /// 重签名后的 codesign -v 复核（测试可注入假实现，避免扫真实 App）。
+    var signatureVerifier: @Sendable () -> Bool = { WeChatDetector.checkSignature() }
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -469,13 +481,19 @@ final class AppViewModel: ObservableObject {
         refresh()
     }
 
-    /// osascript 提权密码框：先激活 App（否则密码框可能无法前置），
-    /// 异步等待进程真正退出，期间 UI 显示「等待管理员授权…」。
+    /// 直接执行 codesign 重签名（不提权、不弹密码框）。
+    /// 包不可写（罕见：所有者不是当前用户）时直接弹终端 sudo 兜底指引。
     func resignWeChat() {
         guard !isResigning else { return }
         activateApp()
+        guard isAppBundleWritable() else {
+            resignGuideReason = .notWritable
+            showAppManagementGuide = true
+            log("⚠️ \(CodeSigner.wechatAppPath) 当前用户不可写，请按指引在终端执行 sudo 命令")
+            return
+        }
         isResigning = true
-        log("正在重签名微信，等待管理员授权…")
+        log("正在重签名微信…")
         resignRunner { [weak self] result in
             Task { @MainActor [weak self] in
                 self?.resignFinished(result: result)
@@ -490,20 +508,32 @@ final class AppViewModel: ObservableObject {
             if let v = wechat.version {
                 UserDefaults.standard.set(v, forKey: DefaultsKey.lastSignedVersion)
             }
-            log("✅ 微信重签名完成")
+            log("✅ 微信重签名完成，正在复核签名…")
             refresh()
-            checkSignatureNow()
-        case .cancelled:
-            // 用户在密码框点了取消：只提示，不算失败。
-            log("已取消授权，微信未重签名")
+            // 签名后自动 codesign -v 复核，结果回日志。
+            let verifier = signatureVerifier
+            Task.detached { [weak self] in
+                let ok = verifier()
+                await self?.resignVerified(ok)
+            }
         case .appManagementDenied(let detail):
-            // TCC「App 管理」权限缺失：提权也绕不过，弹授权指引（含终端兜底命令）。
+            // TCC「App 管理」权限缺失：弹授权指引（含终端兜底命令）。
+            resignGuideReason = .appManagementDenied
             log("⚠️ 重签名被系统拒绝：缺少「App 管理」权限（\(detail)）")
             showAppManagementGuide = true
             refresh()
         case .failed(let message):
             log("⚠️ 重签名未完成：\(message)")
             refresh()
+        }
+    }
+
+    private func resignVerified(_ ok: Bool) {
+        wechat.signatureValid = ok
+        if ok {
+            log("✅ 签名有效（codesign -v 复核通过）")
+        } else {
+            log("⚠️ 重签名后复核仍未通过，请重试；或按指引在终端执行兜底命令")
         }
     }
 

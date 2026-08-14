@@ -1,9 +1,11 @@
 import SwiftUI
 import AppKit
 
-/// 「App 管理」权限指引：重签名被 TCC 拒绝（Operation not permitted）时弹出。
-/// macOS Ventura+ 修改其他 App 的包（含 codesign 重签名）需要该权限，
-/// osascript 提权到 root 也绕不过，必须引导用户去系统设置授权。
+/// 重签名受阻指引：
+/// - appManagementDenied：TCC「App 管理」未授权，codesign 报 Operation not permitted，
+///   引导去系统设置给 WeChatMover 授权一次；
+/// - notWritable：/Applications/WeChat.app 当前用户不可写（罕见，所有者非同用户），
+///   引导在终端执行 sudo 兜底命令。
 struct AppManagementGuideView: View {
     @EnvironmentObject var vm: AppViewModel
     @Environment(\.dismiss) private var dismiss
@@ -11,25 +13,53 @@ struct AppManagementGuideView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("需要「App 管理」权限").font(.headline)
+            Text(vm.resignGuideReason == .notWritable ? "需要在终端手动重签名" : "需要「App 管理」权限")
+                .font(.headline)
 
-            Text("macOS 要求显式允许 WeChatMover 修改其他 App，否则重签名会被系统拒绝（Operation not permitted），输入管理员密码也无法绕过。授权只需一次：")
+            if vm.resignGuideReason == .notWritable {
+                Text("/Applications/WeChat.app 的所有者不是当前用户，WeChatMover 无法直接重签名。请在「终端」App 里执行以下命令：")
+                    .font(.callout)
+                commandBlock
+            } else {
+                Text("重签名由 WeChatMover 直接执行（无需管理员密码），但 macOS 要求显式允许它修改其他 App，否则会被系统拒绝（Operation not permitted）。授权只需一次：")
+                    .font(.callout)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("1. 点击下方按钮，打开 系统设置 → 隐私与安全性 → App 管理")
+                    Text("2. 打开 WeChatMover 的开关（列表中没有就点「+」添加）")
+                    Text("3. 回到这里点「重试重签名」")
+                }
                 .font(.callout)
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("1. 点击下方按钮，打开 系统设置 → 隐私与安全性 → App 管理")
-                Text("2. 打开 WeChatMover 的开关（列表中没有就点「+」添加）")
-                Text("3. 回到这里点「重试重签名」")
+                Button("打开「App 管理」设置") { PermissionHelper.openAppManagement() }
+                    .buttonStyle(.borderedProminent)
+
+                Divider()
+
+                Text("兜底方案：在「终端」App 里执行以下命令（终端通常已有该权限，一般能成功）：")
+                    .font(.callout)
+                commandBlock
             }
-            .font(.callout)
 
-            Button("打开「App 管理」设置") { PermissionHelper.openAppManagement() }
-                .buttonStyle(.borderedProminent)
+            HStack {
+                Button("以后再说") { dismiss() }
+                Spacer()
+                if vm.resignGuideReason != .notWritable {
+                    Button("重试重签名") {
+                        dismiss()
+                        vm.resignWeChat()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(vm.isResigning)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+    }
 
-            Divider()
-
-            Text("兜底方案：在「终端」App 里执行以下命令（终端通常已有该权限，一般能成功）：")
-                .font(.callout)
+    private var commandBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text(CodeSigner.terminalCommand)
                 .font(.system(.caption, design: .monospaced))
                 .textSelection(.enabled)
@@ -41,19 +71,6 @@ struct AppManagementGuideView: View {
                 NSPasteboard.general.setString(CodeSigner.terminalCommand, forType: .string)
                 copied = true
             }
-
-            HStack {
-                Button("以后再说") { dismiss() }
-                Spacer()
-                Button("重试重签名") {
-                    dismiss()
-                    vm.resignWeChat()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(vm.isResigning)
-            }
         }
-        .padding(20)
-        .frame(width: 480)
     }
 }

@@ -1,40 +1,44 @@
 import Foundation
 
-/// codesign 封装 + osascript 提权执行（异步等待进程真正退出，不阻塞主线程）。
+/// codesign 封装：进程内直接执行 /usr/bin/codesign（不走 osascript、不提权）。
+/// 微信是拖拽安装、/Applications/WeChat.app 所有者为当前用户，重签名不需要 root；
+/// 直接执行还能让 TCC「App 管理」权限归责到 WeChatMover 自身，用户授权一次即可
+/// （经 osascript 提权会归责到 security_authtrampoline 等系统中间进程，授权无效）。
+/// 异步等待进程真正退出，不阻塞主线程。
 enum CodeSigner {
     static let wechatAppPath = "/Applications/WeChat.app"
 
-    /// 提权执行的三种结果：成功 / 用户在密码框取消 / 失败。
-    /// App 管理权限缺失（TCC 拒绝修改其他 App 的包）单独分类，便于给专属指引。
+    /// 重签名结果：成功 / App 管理权限缺失（TCC EPERM）/ 一般失败。
     enum ResignResult: Equatable, Sendable {
         case success
-        case cancelled
         case appManagementDenied(String)
         case failed(String)
     }
 
-    /// 需要在管理员密码框中执行的 shell 命令。
+    /// 进程内直接执行的 codesign 参数。
+    static var codesignArguments: [String] {
+        ["--sign", "-", "--force", "--deep", wechatAppPath]
+    }
+
+    /// 兜底方案：包当前用户不可写时在终端里执行的命令（终端通常已有「App 管理」权限）。
     static var shellCommand: String {
         "codesign --sign - --force --deep \(wechatAppPath)"
     }
 
-    /// 兜底方案：终端里执行的命令（终端通常已有「App 管理」权限）。
     static var terminalCommand: String {
         "sudo \(shellCommand)"
     }
 
-    /// 完整的 osascript AppleScript 源码（弹系统密码框提权）。
-    static var appleScriptSource: String {
-        "do shell script \"\(shellCommand)\" with administrator privileges"
+    /// /Applications/WeChat.app 当前用户是否可写（不可写时需终端 sudo 兜底）。
+    static func isWritableByCurrentUser(appPath: String = wechatAppPath) -> Bool {
+        FileManager.default.isWritableFile(atPath: appPath)
     }
 
     /// 由退出码 + stderr 判定结果（纯逻辑，可单测）。
-    /// osascript 提权弹窗「用户取消」报 error -128；
     /// stderr 含 Operation not permitted 是 macOS Ventura+ 的 TCC「App 管理」
-    /// 权限拒绝修改其他 App 的包，提权到 root 也绕不过，单独分类。
+    /// 权限拒绝修改其他 App 的包，单独分类以便弹授权指引。
     static func parseResult(status: Int32, stderr: String) -> ResignResult {
         if status == 0 { return .success }
-        if stderr.contains("User canceled") || stderr.contains("(-128)") { return .cancelled }
         let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if stderr.contains("Operation not permitted") {
             return .appManagementDenied(detail.isEmpty ? "退出码 \(status)" : detail)
@@ -77,16 +81,16 @@ enum CodeSigner {
             try process.run()
         } catch {
             errPipe.fileHandleForReading.readabilityHandler = nil
-            completion(.failed("无法启动提权工具：\(error.localizedDescription)"))
+            completion(.failed("无法启动 codesign：\(error.localizedDescription)"))
         }
     }
 
-    /// 弹出系统密码框，对微信执行 ad-hoc 重签名（异步，completion 在后台线程回调）。
-    /// 调用方负责在调用前激活本 App，否则系统密码框可能无法正常前置。
+    /// 对微信执行 ad-hoc 重签名（异步，completion 在后台线程回调）。
+    /// 不提权、不弹密码框；首次可能触发 TCC「App 管理」授权提示。
     static func resignWeChat(completion: @escaping @Sendable (ResignResult) -> Void) {
         run(
-            executableURL: URL(fileURLWithPath: "/usr/bin/osascript"),
-            arguments: ["-e", appleScriptSource],
+            executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: codesignArguments,
             completion: completion
         )
     }
