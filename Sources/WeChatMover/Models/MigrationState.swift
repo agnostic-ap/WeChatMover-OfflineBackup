@@ -80,6 +80,12 @@ final class AppViewModel: ObservableObject {
     @Published var showExistingTargetConfirm = false
     /// 冲突的目标路径（仅供确认框文案与删除用）。
     @Published var conflictingTargetPath: String? = nil
+    /// 「清理外置数据」二次确认框。
+    @Published var showCleanExternalConfirm = false
+    /// 外置 WeChatData 占用大小（refresh 慢速统计填充；nil = 未统计）。
+    @Published var externalDataSize: Int64? = nil
+    /// 中性提示弹窗（非失败，如"数据仍在使用中"）。
+    @Published var notice: String? = nil
 
     /// 运行状态探测（测试可注入假实现）。
     var isWeChatRunning: () -> Bool = WeChatDetector.isRunning
@@ -147,6 +153,21 @@ final class AppViewModel: ObservableObject {
         !backupItems.isEmpty && !isBusy
     }
 
+    /// 外置数据根目录：<用户选择的目标文件夹>/WeChatData。
+    var externalDataURL: URL? {
+        targetBase.map { WeChatPaths.targetRoot(forBase: $0) }
+    }
+
+    /// 外置 WeChatData 是否存在（决定「清理外置数据」按钮显隐）。
+    var hasExternalData: Bool {
+        guard let url = externalDataURL else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    var canCleanExternalData: Bool {
+        hasExternalData && !isBusy
+    }
+
     // MARK: - 刷新（渐进式并行加载）
 
     /// 每类字段独立后台填充：版本/来源与磁盘余量秒出，数据大小"统计中…"，
@@ -210,6 +231,16 @@ final class AppViewModel: ObservableObject {
                 }
             }
             await self?.applySizes(sized)
+
+            // 外置 WeChatData 占用（状态面板展示；可能分钟级，放最后）。
+            var extSize: Int64? = nil
+            if let savedTarget {
+                let root = WeChatPaths.targetRoot(forBase: URL(fileURLWithPath: savedTarget))
+                if FileManager.default.fileExists(atPath: root.path) {
+                    extSize = DiskProbe.directorySize(at: root)
+                }
+            }
+            await self?.applyExternalDataSize(extSize)
         }
     }
 
@@ -237,6 +268,10 @@ final class AppViewModel: ObservableObject {
         sizesLoaded = true
     }
 
+    private func applyExternalDataSize(_ size: Int64?) {
+        externalDataSize = size
+    }
+
     /// 手动触发签名校验（codesign --verify 要扫整个 App，较慢，后台执行）。
     func checkSignatureNow() {
         guard wechat.isInstalled else { return }
@@ -262,6 +297,7 @@ final class AppViewModel: ObservableObject {
         }
         targetFSType = DiskProbe.volumeFSType(path: base.path)
         targetFreeSpace = DiskProbe.freeSpace(path: base.path)
+        externalDataSize = nil   // 目标变了，占用大小待下次 refresh 重新统计
     }
 
     // MARK: - 目标选择
@@ -568,6 +604,93 @@ final class AppViewModel: ObservableObject {
         }
         if freed == 0, let first = failures.first {
             lastError = first
+        }
+        refresh()
+    }
+
+    // MARK: - 清理外置数据
+
+    /// 是否仍有迁移项的软链指向 WeChatData 内部（仍在使用，禁止删除）。纯逻辑，可单测。
+    nonisolated static func isExternalDataInUse(items: [ItemStatus], dataRoot: URL) -> Bool {
+        let prefix = dataRoot.path + "/"
+        return items.contains { item in
+            guard DiskProbe.isSymlink(item.source),
+                  let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: item.source.path)
+            else { return false }
+            // 本工具建的软链是绝对路径；兜底兼容相对路径
+            let resolved = dest.hasPrefix("/") ? dest : URL(
+                fileURLWithPath: dest,
+                relativeTo: item.source.deletingLastPathComponent()
+            ).standardizedFileURL.path
+            return resolved == dataRoot.path || resolved.hasPrefix(prefix)
+        }
+    }
+
+    /// 删除前确认路径形如 <目标文件夹>/WeChatData，防误删（纯逻辑，可单测）。
+    nonisolated static func isExternalDataPathValid(_ path: String, base: URL) -> Bool {
+        path == WeChatPaths.targetRoot(forBase: base).path
+    }
+
+    /// 「清理外置数据…」按钮：安全校验 → 后台统计大小 → 弹二次确认框。
+    func requestCleanExternalData() {
+        guard let base = targetBase, let root = externalDataURL else { return }
+        // 安全校验 1：仍有软链指向其中 → 数据在使用中
+        guard !Self.isExternalDataInUse(items: items, dataRoot: root) else {
+            notice = "外置数据仍在使用中（存在指向它的符号链接）。如不再需要，请先「一键还原」再清理。"
+            log("⚠️ 清理被拒绝：外置数据仍在使用中")
+            return
+        }
+        // 安全校验 2：路径形态必须是 <目标文件夹>/WeChatData
+        guard Self.isExternalDataPathValid(root.path, base: base) else {
+            lastError = "路径校验失败，已拒绝删除：\(root.path)"
+            log("❌ 清理被拒绝：路径形态异常 \(root.path)")
+            return
+        }
+        isBusy = true
+        log("正在统计外置数据大小…")
+        Task.detached { [weak self] in
+            let size = DiskProbe.directorySize(at: root)
+            await self?.externalDataSized(size)
+        }
+    }
+
+    private func externalDataSized(_ size: Int64) {
+        isBusy = false
+        externalDataSize = size
+        showCleanExternalConfirm = true
+    }
+
+    /// 二次确认「删除」后执行。
+    func cleanExternalData() {
+        guard let base = targetBase, let root = externalDataURL,
+              Self.isExternalDataPathValid(root.path, base: base) else { return }
+        // 确认框打开期间状态可能变化，再查一次使用中
+        guard !Self.isExternalDataInUse(items: items, dataRoot: root) else {
+            notice = "外置数据仍在使用中（存在指向它的符号链接）。如不再需要，请先「一键还原」再清理。"
+            log("⚠️ 清理被拒绝：外置数据仍在使用中")
+            return
+        }
+        isBusy = true
+        log("正在删除外置数据：\(root.path) …")
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                try FileManager.default.removeItem(at: root)
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.cleanExternalDataFinished(error: failed)
+        }
+    }
+
+    private func cleanExternalDataFinished(error: String?) {
+        isBusy = false
+        if let error {
+            lastError = "删除外置数据失败：\(error)"
+            log("❌ 删除外置数据失败：\(error)")
+        } else {
+            log("✅ 已清理外置数据，释放空间 \(DiskProbe.formatBytes(externalDataSize ?? 0))")
+            externalDataSize = nil
         }
         refresh()
     }

@@ -1,30 +1,32 @@
 import SwiftUI
 
-/// 迁移后「重新授权截图/麦克风」图文指引。
+/// 迁移后「权限重新授权」图文指引。
+/// 重签名后系统里旧的微信权限记录会失效，简单关闭再打开开关有时不生效，
+/// 需要先移除再重新添加。
 struct GuideView: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("迁移完成，还需两步").font(.headline)
+            Text("迁移完成，还需重新授权").font(.headline)
 
-            Text("由于数据位置变化并重签名，macOS 会重置微信的部分权限。首次使用以下功能时，请重新授权：")
+            Text("重签名后，系统里旧的微信权限记录会失效，单纯关闭再打开开关有时不生效，需要在设置里**先移除、再重新添加**：")
                 .font(.callout)
 
-            HStack {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("屏幕录制（截图/视频通话共享屏幕）", systemImage: "rectangle.dashed.badge.record")
-                    Label("麦克风（语音/视频通话）", systemImage: "mic")
-                }
-                .font(.callout)
-                Spacer()
-                VStack(spacing: 6) {
-                    Button("打开设置") { PermissionHelper.openScreenRecording() }
-                    Button("打开设置") { PermissionHelper.openMicrophone() }
-                }
+            VStack(alignment: .leading, spacing: 8) {
+                step(1, "打开 系统设置 → 隐私与安全性 → 屏幕录制（微信的截图功能需要它）")
+                step(2, "在列表中选中「微信」，点列表下方的「−」按钮将其移除")
+                step(3, "再点「+」按钮，在应用程序文件夹中重新选中「微信」添加回来")
+                step(4, "对「麦克风」重复同样的移除再添加（语音/视频通话需要它）")
+                step(5, "完全退出微信（⌘Q）再重新打开，权限才会生效")
             }
 
-            Text("提示：授权后若微信未立即生效，请彻底退出微信再重新打开。外置盘未连接时请不要启动微信。")
+            HStack(spacing: 12) {
+                Button("打开屏幕录制设置") { PermissionHelper.openScreenRecording() }
+                Button("打开麦克风设置") { PermissionHelper.openMicrophone() }
+            }
+
+            Text("提示：外置盘未连接时请不要启动微信，否则微信会在原位新建空数据目录。")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
@@ -34,6 +36,14 @@ struct GuideView: View {
             }
         }
         .padding(20)
-        .frame(width: 440)
+        .frame(width: 460)
+    }
+
+    private func step(_ n: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("\(n).").bold().frame(width: 18, alignment: .trailing)
+            Text(text)
+        }
+        .font(.callout)
     }
 }

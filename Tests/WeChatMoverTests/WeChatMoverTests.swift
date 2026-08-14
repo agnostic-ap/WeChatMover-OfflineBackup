@@ -686,3 +686,131 @@ private func makeSignableFixtureApp(root: URL) throws -> URL {
     #expect(result == .success)
     #expect(WeChatDetector.checkSignature(appURL: app))   // codesign -v 复核通过
 }
+
+// MARK: - 清理外置数据：安全校验（纯逻辑 + fixture）
+
+@Test func externalDataPathValidation() {
+    let base = URL(fileURLWithPath: "/Volumes/Ext/MyFolder", isDirectory: true)
+    #expect(AppViewModel.isExternalDataPathValid(
+        "/Volumes/Ext/MyFolder/WeChatData", base: base))
+    // 目标目录外/形态不符一律拒绝
+    #expect(!AppViewModel.isExternalDataPathValid(
+        "/Volumes/Ext/MyFolder", base: base))
+    #expect(!AppViewModel.isExternalDataPathValid(
+        "/Volumes/Ext/MyFolder/WeChatData/xwechat_files", base: base))
+    #expect(!AppViewModel.isExternalDataPathValid(
+        "/Volumes/Ext/Other/WeChatData", base: base))
+    #expect(!AppViewModel.isExternalDataPathValid("/etc", base: base))
+}
+
+@Test func externalDataInUseDetection() throws {
+    try withTempDir { root in
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let dataRoot = WeChatPaths.targetRoot(forBase: base)
+
+        // 已迁移：源位软链 → WeChatData 内部
+        let migratedSource = try makeDataDir(root: root, "c/Documents/xwechat_files")
+        try Migrator.migrateItem(
+            source: migratedSource,
+            target: WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files"))
+        let migratedItem = ItemStatus(
+            subdir: "Documents/xwechat_files", source: migratedSource,
+            state: .migrated, size: 0, hasBackup: true, backupSize: 0)
+        #expect(AppViewModel.isExternalDataInUse(items: [migratedItem], dataRoot: dataRoot))
+
+        // 本地（未迁移）目录不算使用
+        let localSource = try makeDataDir(root: root, "c/Documents/app_data")
+        let localItem = ItemStatus(
+            subdir: "Documents/app_data", source: localSource,
+            state: .local, size: 0, hasBackup: false, backupSize: 0)
+        #expect(!AppViewModel.isExternalDataInUse(items: [localItem], dataRoot: dataRoot))
+        #expect(!AppViewModel.isExternalDataInUse(items: [], dataRoot: dataRoot))
+
+        // 指向别处的软链不算使用
+        let elsewhere = root.appendingPathComponent("elsewhere_link")
+        try FileManager.default.createSymbolicLink(
+            at: elsewhere, withDestinationURL: root.appendingPathComponent("c"))
+        let otherItem = ItemStatus(
+            subdir: "elsewhere", source: elsewhere,
+            state: .migrated, size: 0, hasBackup: false, backupSize: 0)
+        #expect(!AppViewModel.isExternalDataInUse(items: [otherItem], dataRoot: dataRoot))
+
+        // 软链指向 WeChatData 但目标不可达（外置盘未插）仍算使用
+        let broken = root.appendingPathComponent("broken_link")
+        try FileManager.default.createSymbolicLink(
+            at: broken, withDestinationURL: dataRoot.appendingPathComponent("gone"))
+        let brokenItem = ItemStatus(
+            subdir: "broken", source: broken,
+            state: .brokenSymlink, size: 0, hasBackup: false, backupSize: 0)
+        #expect(AppViewModel.isExternalDataInUse(items: [brokenItem], dataRoot: dataRoot))
+    }
+}
+
+// MARK: - 清理外置数据：完整流程（临时目录 fixture）
+
+@MainActor @Test func cleanExternalDataRefusedWhenInUse() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    try Migrator.migrateItem(
+        source: source,
+        target: WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files"))
+
+    let vm = AppViewModel()
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .migrated, size: 128, hasBackup: true, backupSize: 128)]
+
+    // 迁移中 → 拒绝，弹中性提示，不弹确认框、不删数据
+    vm.requestCleanExternalData()
+    #expect(vm.notice?.contains("仍在使用中") == true)
+    #expect(!vm.showCleanExternalConfirm)
+    #expect(FileManager.default.fileExists(
+        atPath: WeChatPaths.targetRoot(forBase: base).path))
+}
+
+@MainActor @Test func cleanExternalDataFlow() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    // 先迁移再还原：源位恢复本地，外置 WeChatData 保留（典型清理场景）
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128, 256])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+    try Migrator.migrateItem(source: source, target: target)
+    try Migrator.restoreItem(source: source, target: target)
+    #expect(itemState(at: source) == .local)
+
+    let vm = AppViewModel()
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .local, size: 384, hasBackup: false, backupSize: 0)]
+
+    // 1. 统计大小 → 弹二次确认框
+    vm.requestCleanExternalData()
+    #expect(await waitUntil { vm.showCleanExternalConfirm })
+    #expect(vm.externalDataSize == 384)
+    #expect(vm.notice == nil && vm.lastError == nil)
+    #expect(FileManager.default.fileExists(atPath: target.path))   // 尚未删除
+
+    // 2. 确认删除 → WeChatData 整体移除，日志显示释放空间
+    vm.cleanExternalData()
+    #expect(await waitUntil { !vm.isBusy })
+    #expect(!FileManager.default.fileExists(
+        atPath: WeChatPaths.targetRoot(forBase: base).path))
+    #expect(vm.lastError == nil)
+    #expect(vm.logs.contains { $0.contains("释放空间") })
+}

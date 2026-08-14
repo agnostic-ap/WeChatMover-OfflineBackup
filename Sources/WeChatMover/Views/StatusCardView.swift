@@ -28,6 +28,10 @@ struct StatusCardView: View {
                     row("目标卷格式", fs + (vm.isTargetAPFS ? " ✅" : " ⚠️ 非 APFS"))
                     row("目标卷剩余", DiskProbe.formatBytes(vm.targetFreeSpace ?? 0))
                 }
+                if vm.hasExternalData {
+                    row("外置数据占用",
+                        vm.externalDataSize.map(DiskProbe.formatBytes) ?? "统计中…")
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 4)

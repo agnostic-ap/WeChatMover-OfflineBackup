@@ -65,6 +65,17 @@ struct ContentView: View {
         } message: {
             Text("\(vm.conflictingTargetPath ?? "") 已存在数据，可能来自上次迁移中断或重复迁移。删除后不可恢复，确认删除并重新迁移？")
         }
+        .alert("清理外置数据", isPresented: $vm.showCleanExternalConfirm) {
+            Button("取消", role: .cancel) {}
+            Button("删除", role: .destructive) { vm.cleanExternalData() }
+        } message: {
+            Text("将删除外置硬盘上的 \(vm.externalDataURL?.path ?? "")（约 \(DiskProbe.formatBytes(vm.externalDataSize ?? 0))）。删除后不可恢复；本机数据不受影响。")
+        }
+        .alert("提示", isPresented: noticePresented) {
+            Button("好") { vm.notice = nil }
+        } message: {
+            Text(vm.notice ?? "")
+        }
         .alert("操作失败", isPresented: errorPresented) {
             Button("好") { vm.lastError = nil }
         } message: {
@@ -74,6 +85,10 @@ struct ContentView: View {
 
     private var errorPresented: Binding<Bool> {
         Binding(get: { vm.lastError != nil }, set: { if !$0 { vm.lastError = nil } })
+    }
+
+    private var noticePresented: Binding<Bool> {
+        Binding(get: { vm.notice != nil }, set: { if !$0 { vm.notice = nil } })
     }
 
     private var masBanner: some View {
@@ -128,6 +143,11 @@ struct ContentView: View {
                 if !vm.backupItems.isEmpty {
                     Button("删除备份…") { vm.showBackupConfirm = true }
                         .disabled(!vm.canDeleteBackups)
+                }
+
+                if vm.hasExternalData {
+                    Button("清理外置数据…") { vm.requestCleanExternalData() }
+                        .disabled(!vm.canCleanExternalData)
                 }
 
                 if vm.wechatVersionChanged || vm.wechat.signatureValid == false {
