@@ -73,6 +73,25 @@ bash Scripts/test.sh
 
 还原：点击「一键还原」。本地 `_backup` 还在时秒还原（改名回去即可）；备份已删则从外置盘完整拷回。完成后再次重签名。
 
+## 常见问题
+
+### 重签名失败：Operation not permitted
+
+macOS Ventura 及以上有「App 管理」权限：修改其他 App 的包（含 codesign 重签名）必须显式授权，osascript 提权到 root 也绕不过。日志出现 `Operation not permitted` 时，工具会自动弹出指引：
+
+1. 点指引里的按钮打开 系统设置 → 隐私与安全性 → **App 管理**，打开 WeChatMover 的开关（列表中没有就点「+」添加）；
+2. 回到工具点「重试重签名」。
+
+兜底方案：在「终端」里执行（终端通常已有该权限，一般能成功，指引弹窗里有「复制命令」按钮）：
+
+```bash
+sudo codesign --sign - --force --deep /Applications/WeChat.app
+```
+
+### 迁移失败：目标位置已存在数据
+
+说明目标文件夹里已有 `WeChatData/<子目录>`，通常来自上次迁移中断或重复迁移。工具会弹确认框：选「删除旧数据并重新迁移」会删掉旧数据后自动重跑（删除前请确认旧数据无用）；选「取消」则可手工检查后重试。
+
 ## 项目结构
 
 ```

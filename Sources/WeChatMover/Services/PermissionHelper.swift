@@ -6,6 +6,7 @@ enum PermissionHelper {
     static let fullDiskAccessURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
     static let screenRecordingURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
     static let microphoneURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+    static let appManagementURL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AppManagement"
 
     /// 能否读取微信容器（无完全磁盘访问权限时读取会失败/为空）。
     static func canReadContainer(path: String) -> Bool {
@@ -23,4 +24,5 @@ enum PermissionHelper {
     static func openFullDiskAccess() { openSettings(fullDiskAccessURL) }
     static func openScreenRecording() { openSettings(screenRecordingURL) }
     static func openMicrophone() { openSettings(microphoneURL) }
+    static func openAppManagement() { openSettings(appManagementURL) }
 }

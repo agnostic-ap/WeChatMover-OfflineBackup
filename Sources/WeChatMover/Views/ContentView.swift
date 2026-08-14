@@ -40,6 +40,7 @@ struct ContentView: View {
         .padding(18)
         .sheet(isPresented: $vm.showMigrateSheet) { MigrateFlowView().environmentObject(vm) }
         .sheet(isPresented: $vm.showGuide) { GuideView() }
+        .sheet(isPresented: $vm.showAppManagementGuide) { AppManagementGuideView().environmentObject(vm) }
         .alert("目标卷不是 APFS", isPresented: $vm.showNonAPFSAlert) {
             Button("我知道了（仍要使用）", role: .cancel) {}
             Button("重新选择") { vm.chooseTarget() }
@@ -57,6 +58,12 @@ struct ContentView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("需要先退出微信才能迁移。将优先优雅退出，几秒后仍未退出会强制结束；聊天记录不受影响。")
+        }
+        .alert("目标位置已有数据", isPresented: $vm.showExistingTargetConfirm) {
+            Button("删除旧数据并重新迁移", role: .destructive) { vm.removeConflictingTargetAndMigrate() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("\(vm.conflictingTargetPath ?? "") 已存在数据，可能来自上次迁移中断或重复迁移。删除后不可恢复，确认删除并重新迁移？")
         }
         .alert("操作失败", isPresented: errorPresented) {
             Button("好") { vm.lastError = nil }

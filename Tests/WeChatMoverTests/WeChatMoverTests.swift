@@ -534,3 +534,116 @@ private final class QuitFixture: @unchecked Sendable {
     let exited = await WeChatQuitter.waitForExit(timeout: 1, pollInterval: 0.1) { false }
     #expect(exited)
 }
+
+// MARK: - App 管理权限缺失分类（TCC EPERM）
+
+@Test func parseResignResultAppManagementDenied() {
+    // 用户实测的真实 stderr
+    let real = """
+        0:105: execution error: /Applications/WeChat.app: replacing existing signature
+        /Applications/WeChat.app: Operation not permitted
+        In subcomponent: /Applications/WeChat.app/Contents/MacOS/WeChatAppEx.app (1)
+        """
+    let result = CodeSigner.parseResult(status: 1, stderr: real)
+    guard case .appManagementDenied(let detail) = result else {
+        Issue.record("EPERM 应分类为 appManagementDenied，实际 \(result)")
+        return
+    }
+    #expect(detail.contains("Operation not permitted"))
+    // 不含 EPERM 的普通失败仍走 failed
+    #expect(CodeSigner.parseResult(status: 1, stderr: "boom") == .failed("boom"))
+    // 取消优先级不变
+    #expect(CodeSigner.parseResult(status: 1, stderr: "User canceled. (-128)") == .cancelled)
+}
+
+@Test func terminalFallbackCommand() {
+    #expect(CodeSigner.terminalCommand
+            == "sudo codesign --sign - --force --deep /Applications/WeChat.app")
+}
+
+// MARK: - 目标冲突路径安全检查（纯逻辑）
+
+@Test func conflictPathSafety() {
+    let base = URL(fileURLWithPath: "/Volumes/Ext/test", isDirectory: true)
+    #expect(AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/test/WeChatData/xwechat_files", base: base))
+    // 目标目录外一律拒绝
+    #expect(!AppViewModel.isConflictPathInsideTarget("/Volumes/Ext/test", base: base))
+    #expect(!AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/test/WeChatData", base: base))
+    #expect(!AppViewModel.isConflictPathInsideTarget("/etc/whatever", base: base))
+    #expect(!AppViewModel.isConflictPathInsideTarget(
+        "/Volumes/Ext/test2/WeChatData/x", base: base))
+}
+
+// MARK: - 迁移目标冲突流程（临时目录 fixture，注入假依赖）
+
+/// 轮询等待 MainActor 上的条件成立（集成测试用）。
+@MainActor
+private func waitUntil(
+    _ timeout: TimeInterval = 10,
+    _ condition: @MainActor () -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if condition() { return true }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+    return condition()
+}
+
+@MainActor @Test func migrationTargetConflictFlow() async throws {
+    // withTempDir 是同步闭包，这里要 await，改为内联临时目录（同样的 fixture 约定）
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    let target = WeChatPaths.targetDirectory(base: base,
+                                             subdir: "Documents/xwechat_files")
+    // 上次中断/重复迁移留下的旧数据
+    _ = try makeDataDir(root: root, "external/WeChatData/xwechat_files",
+                        fileSizes: [64])
+
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }   // 不弹真实密码框
+    // 容器根指向 fixture：refresh() 重建 items 时不会碰到真实微信数据
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .local, size: 128, hasBackup: false, backupSize: 0)]
+
+    // 1. 目标已存在 → 不判失败，弹「删除旧数据并重新迁移」确认框
+    vm.startMigration()
+    #expect(await waitUntil { vm.showExistingTargetConfirm })
+    #expect(vm.conflictingTargetPath == target.path)
+    #expect(vm.lastError == nil)
+    #expect(vm.logs.contains { $0.contains("目标位置已有数据") })
+    #expect(FileManager.default.fileExists(atPath: target.path))   // 旧数据还在
+
+    // 2. 确认删除旧数据并重新迁移 → 迁移成功
+    vm.removeConflictingTargetAndMigrate()
+    let migrated = await waitUntil {
+        !vm.isBusy && itemState(at: source) == .migrated
+    }
+    #expect(migrated)
+    #expect(DiskProbe.directorySize(at: target) == 128)   // 新数据覆盖了旧数据
+    #expect(vm.lastError == nil)
+}
+
+@MainActor @Test func resignAppManagementDeniedShowsGuide() async {
+    let vm = AppViewModel()
+    vm.resignRunner = { completion in
+        completion(.appManagementDenied("Operation not permitted"))
+    }
+    vm.resignWeChat()
+    #expect(await waitUntil { vm.showAppManagementGuide })
+    #expect(!vm.isResigning)
+    #expect(vm.lastError == nil)   // 不算普通失败，走专属指引
+    #expect(vm.logs.contains { $0.contains("App 管理") })
+}

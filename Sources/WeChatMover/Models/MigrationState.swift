@@ -66,6 +66,18 @@ final class AppViewModel: ObservableObject {
     @Published var isQuittingWeChat = false
     /// 正在等待 osascript 提权密码框的结果（重签名进行中）。
     @Published var isResigning = false
+    /// 重签名被 TCC「App 管理」权限拒绝：弹授权指引。
+    @Published var showAppManagementGuide = false
+    /// 迁移目标已存在数据：弹「删除旧数据并重新迁移 / 取消」确认框。
+    @Published var showExistingTargetConfirm = false
+    /// 冲突的目标路径（仅供确认框文案与删除用）。
+    @Published var conflictingTargetPath: String? = nil
+
+    /// 运行状态探测（测试可注入假实现）。
+    var isWeChatRunning: () -> Bool = WeChatDetector.isRunning
+    /// 实际执行重签名的闭包（测试可注入假实现，避免弹真实密码框）。
+    var resignRunner: (@escaping @Sendable (CodeSigner.ResignResult) -> Void) -> Void =
+        CodeSigner.resignWeChat
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -73,7 +85,8 @@ final class AppViewModel: ObservableObject {
         return wechat.isAppStoreVersion ? "App Store 版" : "官网 DMG 版"
     }
 
-    private let containerRoot = WeChatPaths.defaultContainerRoot
+    /// 容器根目录（测试可注入临时目录 fixture，默认真实路径）。
+    var containerRoot = WeChatPaths.defaultContainerRoot
 
     // MARK: - 派生状态
 
@@ -245,7 +258,7 @@ final class AppViewModel: ObservableObject {
     /// ad-hoc 手工打包的 App 可能处于未激活状态，此时系统面板/密码框无法前置而假死。
     /// 所有系统对话框入口（NSOpenPanel、osascript 提权/自动化弹窗）都必须先调它。
     func activateApp() {
-        NSApp.setActivationPolicy(.regular)
+        NSApplication.shared.setActivationPolicy(.regular)
         NSRunningApplication.current.activate(options: [.activateAllWindows])
     }
 
@@ -285,7 +298,7 @@ final class AppViewModel: ObservableObject {
     func requestMigration() {
         guard canMigrate else { return }
         // 刷新一次运行状态，避免上次探测后用户又打开了微信。
-        wechat.isRunning = WeChatDetector.isRunning()
+        wechat.isRunning = isWeChatRunning()
         if wechat.isRunning {
             showQuitWeChatConfirm = true
         } else {
@@ -307,7 +320,7 @@ final class AppViewModel: ObservableObject {
 
     private func quitWeChatFinished(_ quit: Bool) {
         isQuittingWeChat = false
-        wechat.isRunning = WeChatDetector.isRunning()
+        wechat.isRunning = isWeChatRunning()
         if quit && !wechat.isRunning {
             log("✅ 微信已退出")
             showMigrateSheet = true
@@ -320,7 +333,7 @@ final class AppViewModel: ObservableObject {
     func startMigration() {
         guard let base = targetBase else { return }
         // 兜底：确认页打开期间微信又被启动，拒绝迁移。
-        wechat.isRunning = WeChatDetector.isRunning()
+        wechat.isRunning = isWeChatRunning()
         guard !wechat.isRunning else {
             lastError = "微信正在运行，请先退出微信再迁移。"
             log("❌ 迁移被拒绝：微信正在运行")
@@ -349,7 +362,7 @@ final class AppViewModel: ObservableObject {
         }
 
         Task.detached { [weak self] in
-            var failed: String? = nil
+            var failed: (any Error)? = nil
             do {
                 try Migrator.checkSpace(totalBytes: total, targetPath: base.path)
                 for item in todo {
@@ -358,25 +371,68 @@ final class AppViewModel: ObservableObject {
                     await self?.log("✅ 已迁移：\(item.displayName)")
                 }
             } catch {
-                failed = error.localizedDescription
+                failed = error
             }
             await self?.migrationFinished(error: failed)
             poller.cancel()
         }
     }
 
-    private func migrationFinished(error: String?) {
+    private func migrationFinished(error: (any Error)?) {
         isBusy = false
         progress = 1
         if let error {
-            lastError = error
-            log("❌ 迁移失败：\(error)")
+            if case MigrationError.targetAlreadyExists(let path) = error {
+                // 目标已存在：可能来自上次迁移中断或重复迁移，
+                // 不直接判失败，弹确认框让用户选择删除旧数据后重新迁移。
+                conflictingTargetPath = path
+                showExistingTargetConfirm = true
+                log("⚠️ 目标位置已有数据，可能来自上次迁移中断或重复迁移：\(path)")
+            } else {
+                lastError = error.localizedDescription
+                log("❌ 迁移失败：\(error.localizedDescription)")
+            }
         } else {
             log("全部迁移完成，正在重签名微信…")
             resignWeChat()
             showGuide = true
         }
         refresh()
+    }
+
+    /// 冲突路径必须形如 <base>/WeChatData/<子目录> 才允许删除，防误删（纯逻辑，可单测）。
+    nonisolated static func isConflictPathInsideTarget(_ path: String, base: URL) -> Bool {
+        path.hasPrefix(base.path + "/WeChatData/")
+    }
+
+    /// 确认框「删除旧数据并重新迁移」：删掉冲突目标后重跑迁移。
+    func removeConflictingTargetAndMigrate() {
+        guard let path = conflictingTargetPath, let base = targetBase else { return }
+        guard Self.isConflictPathInsideTarget(path, base: base) else {
+            conflictingTargetPath = nil
+            lastError = "路径不在所选目标目录内，已拒绝删除：\(path)"
+            log("❌ 拒绝删除目标目录外的路径：\(path)")
+            return
+        }
+        conflictingTargetPath = nil
+        isBusy = true
+        progress = 0
+        log("正在删除旧目标数据：\(path) …")
+        Task.detached { [weak self] in
+            do {
+                try FileManager.default.removeItem(atPath: path)
+                await self?.log("✅ 已删除旧数据，重新迁移…")
+                await self?.startMigration()
+            } catch {
+                await self?.removeConflictFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func removeConflictFailed(_ message: String) {
+        isBusy = false
+        lastError = "删除旧数据失败：\(message)"
+        log("❌ 删除旧数据失败：\(message)")
     }
 
     func startRestore() {
@@ -420,7 +476,7 @@ final class AppViewModel: ObservableObject {
         activateApp()
         isResigning = true
         log("正在重签名微信，等待管理员授权…")
-        CodeSigner.resignWeChat { [weak self] result in
+        resignRunner { [weak self] result in
             Task { @MainActor [weak self] in
                 self?.resignFinished(result: result)
             }
@@ -440,6 +496,11 @@ final class AppViewModel: ObservableObject {
         case .cancelled:
             // 用户在密码框点了取消：只提示，不算失败。
             log("已取消授权，微信未重签名")
+        case .appManagementDenied(let detail):
+            // TCC「App 管理」权限缺失：提权也绕不过，弹授权指引（含终端兜底命令）。
+            log("⚠️ 重签名被系统拒绝：缺少「App 管理」权限（\(detail)）")
+            showAppManagementGuide = true
+            refresh()
         case .failed(let message):
             log("⚠️ 重签名未完成：\(message)")
             refresh()

@@ -5,9 +5,11 @@ enum CodeSigner {
     static let wechatAppPath = "/Applications/WeChat.app"
 
     /// 提权执行的三种结果：成功 / 用户在密码框取消 / 失败。
+    /// App 管理权限缺失（TCC 拒绝修改其他 App 的包）单独分类，便于给专属指引。
     enum ResignResult: Equatable, Sendable {
         case success
         case cancelled
+        case appManagementDenied(String)
         case failed(String)
     }
 
@@ -16,17 +18,27 @@ enum CodeSigner {
         "codesign --sign - --force --deep \(wechatAppPath)"
     }
 
+    /// 兜底方案：终端里执行的命令（终端通常已有「App 管理」权限）。
+    static var terminalCommand: String {
+        "sudo \(shellCommand)"
+    }
+
     /// 完整的 osascript AppleScript 源码（弹系统密码框提权）。
     static var appleScriptSource: String {
         "do shell script \"\(shellCommand)\" with administrator privileges"
     }
 
     /// 由退出码 + stderr 判定结果（纯逻辑，可单测）。
-    /// osascript 提权弹窗「用户取消」报 error -128，与签名失败区分开。
+    /// osascript 提权弹窗「用户取消」报 error -128；
+    /// stderr 含 Operation not permitted 是 macOS Ventura+ 的 TCC「App 管理」
+    /// 权限拒绝修改其他 App 的包，提权到 root 也绕不过，单独分类。
     static func parseResult(status: Int32, stderr: String) -> ResignResult {
         if status == 0 { return .success }
         if stderr.contains("User canceled") || stderr.contains("(-128)") { return .cancelled }
         let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if stderr.contains("Operation not permitted") {
+            return .appManagementDenied(detail.isEmpty ? "退出码 \(status)" : detail)
+        }
         return .failed(detail.isEmpty ? "退出码 \(status)" : detail)
     }
 
