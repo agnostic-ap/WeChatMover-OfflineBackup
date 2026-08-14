@@ -93,6 +93,9 @@ final class AppViewModel: ObservableObject {
     /// 还原确认框附加说明（如"外置数据与本地备份一致，可直接使用本地备份"）。
     @Published var restoreNote: String? = nil
 
+    /// 「还原外置」确认后要走的实际路径：true = 强制从外置拷回（外置更新分支）。
+    private var pendingRestoreForceExternal = false
+
     // 兼容既有测试的只读映射（弹窗语义不变）。
     var showExistingTargetConfirm: Bool { activeDialog == .existingTarget }
     var showCleanExternalConfirm: Bool { activeDialog == .cleanExternal }
@@ -673,6 +676,7 @@ final class AppViewModel: ObservableObject {
     func requestRestore() {
         guard canRestore else { return }
         restoreNote = nil
+        pendingRestoreForceExternal = false
         let withBackup = migratedItems.filter { $0.hasBackup }
         guard !withBackup.isEmpty, let base = targetBase else {
             // 无本地备份：维持现状，直接从外置还原
@@ -714,14 +718,15 @@ final class AppViewModel: ObservableObject {
         busyKind = nil
         switch same {
         case .some(true):
-            // 一致：不弹新旧提示，直接走本地备份还原（快），确认框注明原因
-            restoreNote = "外置数据与本地备份一致，可直接使用本地备份还原（更快）。"
-            log("外置数据与本地备份一致，直接使用本地备份还原")
-            activeDialog = .restoreConfirm
+            // 一致：提示可直接用内置备份（省拷贝时间），也可仍从外置拷贝
+            log("外置数据与内置备份一致，提示可选择内置备份快速还原")
+            activeDialog = .restoreSameChoice
         case .some(false):
-            restoreNote = nil
-            log("⚠️ 外置数据与本地备份不一致（迁移后可能有新写入）")
-            activeDialog = .restoreConflict
+            // 外置更新：用户点的就是「还原外置」，直接使用外置数据，不弹新旧提示
+            pendingRestoreForceExternal = true
+            restoreNote = "外置数据比内置备份新（迁移后有新聊天记录写入外置盘），本次将使用外置硬盘上的数据还原；拷回后过期的内置备份与外置副本会被清理。"
+            log("外置数据有更新，按你的选择使用外置数据还原")
+            activeDialog = .restoreConfirm
         case .none:
             // 比对失败（外置盘断开等）：回退现有流程
             restoreNote = nil
@@ -731,13 +736,56 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 还原外置数据确认框「确认还原」：与迁移一致，运行中先退出微信再还原。
+    /// 外置更新的分支里 pendingRestoreForceExternal = true，强制从外置拷回。
     func confirmRestore() {
-        quitWeChatIfRunning { [weak self] in self?.startRestore() }
+        let forceExternal = pendingRestoreForceExternal
+        pendingRestoreForceExternal = false
+        quitWeChatIfRunning { [weak self] in
+            forceExternal ? self?.startRestoreFromExternal() : self?.startRestore()
+        }
     }
 
     /// 新旧不一致时「使用外置数据还原」：忽略本地备份，强制从外置盘拷回。
     func confirmRestoreFromExternal() {
         quitWeChatIfRunning { [weak self] in self?.startRestoreFromExternal() }
+    }
+
+    /// 「还原内置存储数据到 Mac…」入口：外置可达时先做新旧判定。
+    /// 外置更新 → 提示改用外置；一致或无法比对（拔盘）→ 直接走内置备份确认框。
+    func requestRestoreBackups() {
+        guard canRestoreBackups else { return }
+        let todo = restorableBackupItems
+        guard let base = targetBase, !todo.isEmpty, hasExternalData else {
+            // 拔盘/无外置数据：无法比对，直接用本地备份（不阻塞）
+            log("外置盘未连接，跳过新旧比对")
+            activeDialog = .backupRestoreConfirm
+            return
+        }
+        isBusy = true
+        busyKind = .comparing
+        log("正在比对数据新旧…")
+        Task.detached { [weak self] in
+            let same = Self.externalMatchesBackup(items: todo, base: base)
+            await self?.backupComparisonFinished(same: same)
+        }
+    }
+
+    private func backupComparisonFinished(same: Bool?) {
+        isBusy = false
+        busyKind = nil
+        switch same {
+        case .some(false):
+            // 外置更新：提示改用外置数据还原（用户点的是内置入口，需要提醒）
+            log("⚠️ 外置数据比内置备份新（迁移后有新写入）")
+            activeDialog = .restoreNewerChoice
+        case .some(true):
+            // 一致：数据相同无需打扰，直接走内置备份确认框
+            log("外置数据与内置备份一致，直接使用内置备份还原")
+            activeDialog = .backupRestoreConfirm
+        case .none:
+            log("⚠️ 无法读取外置数据进行比对，按原流程继续")
+            activeDialog = .backupRestoreConfirm
+        }
     }
 
     /// 还原内置备份确认框「确认还原」：同样先确保微信已退出。

@@ -49,7 +49,7 @@ struct ActionSection: View {
                     .frame(minWidth: 220, minHeight: 40)
                     .disabled(!vm.canRestore)
             case .restoreBackups:
-                Button("还原内置存储数据到 Mac…") { vm.activeDialog = .backupRestoreConfirm }
+                Button("还原内置存储数据到 Mac…") { vm.requestRestoreBackups() }
                     .buttonStyle(.borderedProminent)
                     .tint(DesignTokens.Colors.accent)
                     .controlSize(.large)
@@ -93,7 +93,7 @@ struct ManageSection: View {
                         Spacer()
                         // 「还原内置存储数据到 Mac…」是中央主按钮时（backupOnly 状态）这里不重复显示
                         if showRestoreBackupsButton {
-                            Button("还原内置存储数据到 Mac…") { vm.activeDialog = .backupRestoreConfirm }
+                            Button("还原内置存储数据到 Mac…") { vm.requestRestoreBackups() }
                                 .controlSize(.small)
                                 .disabled(!vm.canRestoreBackups)
                                 .help("从本地备份还原：放弃迁移，回到 Mac 上的旧数据（不需要外置硬盘）")

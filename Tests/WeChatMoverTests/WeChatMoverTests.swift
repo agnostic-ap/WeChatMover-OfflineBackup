@@ -1283,8 +1283,8 @@ private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
     try writeManifestFor(base: base, subdir: "Documents/xwechat_files", target: target)
 
     vm.requestRestore()
-    #expect(await waitUntil { vm.activeDialog == .restoreConfirm && !vm.isBusy })
-    #expect(vm.restoreNote?.contains("一致") == true)   // 注明直接用本地备份
+    // 一致：提示可选内置备份（更快）或仍从外置拷贝
+    #expect(await waitUntil { vm.activeDialog == .restoreSameChoice && !vm.isBusy })
 }
 
 @MainActor @Test func restoreDecisionSameWithoutManifest() async throws {
@@ -1295,11 +1295,10 @@ private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
     let (vm, _, _, _) = try makeRestoreFixture(root)   // 不写 manifest → 双侧兜底
 
     vm.requestRestore()
-    #expect(await waitUntil { vm.activeDialog == .restoreConfirm && !vm.isBusy })
-    #expect(vm.restoreNote?.contains("一致") == true)
+    #expect(await waitUntil { vm.activeDialog == .restoreSameChoice && !vm.isBusy })
 }
 
-@MainActor @Test func restoreDecisionDiffersShowsConflict() async throws {
+@MainActor @Test func restoreDecisionDiffersUsesExternal() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1310,8 +1309,9 @@ private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
     try Data(repeating: 7, count: 64).write(to: target.appendingPathComponent("new-chat.bin"))
 
     vm.requestRestore()
-    #expect(await waitUntil { vm.activeDialog == .restoreConflict && !vm.isBusy })
-    #expect(vm.restoreNote == nil)
+    // 外置更新：用户点的就是「还原外置」，直接用外置数据（确认框注明），不弹新旧选择
+    #expect(await waitUntil { vm.activeDialog == .restoreConfirm && !vm.isBusy })
+    #expect(vm.restoreNote?.contains("外置数据比内置备份新") == true)
 }
 
 @MainActor @Test func restoreDecisionNoBackupSkipsCompare() {
@@ -1323,6 +1323,47 @@ private func writeManifestFor(base: URL, subdir: String, target: URL) throws {
     vm.requestRestore()
     // 无本地备份 → 不比对，直接弹常规确认框
     #expect(vm.activeDialog == .restoreConfirm)
+    #expect(vm.busyKind == nil)
+}
+
+// MARK: - 内置备份入口的新旧判定
+
+@MainActor @Test func backupRestoreDecisionSameGoesConfirm() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (vm, _, base, target) = try makeRestoreFixture(root)
+    try writeManifestFor(base: base, subdir: "Documents/xwechat_files", target: target)
+
+    vm.requestRestoreBackups()
+    // 一致：无需打扰，直接走内置备份确认框
+    #expect(await waitUntil { vm.activeDialog == .backupRestoreConfirm && !vm.isBusy })
+}
+
+@MainActor @Test func backupRestoreDecisionDiffersShowsNewerChoice() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let (vm, _, base, target) = try makeRestoreFixture(root)
+    try writeManifestFor(base: base, subdir: "Documents/xwechat_files", target: target)
+    try Data(repeating: 7, count: 64).write(to: target.appendingPathComponent("new-chat.bin"))
+
+    vm.requestRestoreBackups()
+    // 外置更新：提示改用外置数据还原
+    #expect(await waitUntil { vm.activeDialog == .restoreNewerChoice && !vm.isBusy })
+}
+
+@MainActor @Test func backupRestoreDecisionUnpluggedSkipsCompare() {
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    // 有备份但无目标盘（拔盘）：跳过比对直接走内置备份确认框
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files",
+                           source: URL(fileURLWithPath: "/tmp/c/x"),
+                           state: .migrated, size: 100, hasBackup: true, backupSize: 100)]
+    vm.requestRestoreBackups()
+    #expect(vm.activeDialog == .backupRestoreConfirm)
     #expect(vm.busyKind == nil)
 }
 

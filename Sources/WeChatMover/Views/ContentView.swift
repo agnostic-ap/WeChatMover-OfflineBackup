@@ -23,33 +23,56 @@ struct ContentView: View {
         .background(DesignTokens.Colors.background)
         .toolbar { toolbarItems }
         .alert(item: alertOnlyDialog, content: dialog)
-        // 三选项的「新旧不一致」用 confirmationDialog（Alert 只支持两个按钮），
+        // 三选项弹窗用 confirmationDialog（Alert 只支持两个按钮），
         // 仍由 ActiveDialog 单一枚举驱动，这里只是按呈现方式拆绑定。
         .confirmationDialog(
-            "外置数据与本地备份不一致",
-            isPresented: restoreConflictPresented,
+            "外置数据与内置备份一致",
+            isPresented: restoreSameChoicePresented,
             titleVisibility: .visible
         ) {
-            Button("使用外置数据还原（推荐）") { vm.confirmRestoreFromExternal() }
-            Button("仍使用本地备份（将丢失外置盘上的新数据）", role: .destructive) { vm.confirmRestore() }
+            Button("使用内置备份（更快）") { vm.confirmRestoreBackups() }
+            Button("仍从外置硬盘拷贝") { vm.confirmRestoreFromExternal() }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("外置硬盘上的数据与本地备份不一致，通常是迁移后有新聊天记录写入外置盘，建议优先还原外置数据。")
+            Text("两侧数据内容一致。使用内置备份无需拷贝、速度更快，外置硬盘上的数据保留不动。")
+        }
+        .confirmationDialog(
+            "外置数据比内置备份新",
+            isPresented: restoreNewerChoicePresented,
+            titleVisibility: .visible
+        ) {
+            Button("改用外置数据还原（推荐）") { vm.confirmRestoreFromExternal() }
+            Button("仍使用内置备份（将丢失外置盘上的新数据）", role: .destructive) { vm.confirmRestoreBackups() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("外置硬盘上的数据比内置备份新（通常是迁移后有新聊天记录写入外置盘），建议优先还原外置数据。")
         }
         .sheet(item: $vm.activeSheet, content: sheet)
     }
 
-    /// .alert 绑定：restoreConflict 走 confirmationDialog，这里过滤掉避免双弹。
+    /// .alert 绑定：三选项弹窗走 confirmationDialog，这里过滤掉避免双弹。
     private var alertOnlyDialog: Binding<ActiveDialog?> {
         Binding(
-            get: { vm.activeDialog == .restoreConflict ? nil : vm.activeDialog },
+            get: {
+                switch vm.activeDialog {
+                case .restoreSameChoice, .restoreNewerChoice: return nil
+                default: return vm.activeDialog
+                }
+            },
             set: { vm.activeDialog = $0 }
         )
     }
 
-    private var restoreConflictPresented: Binding<Bool> {
+    private var restoreSameChoicePresented: Binding<Bool> {
         Binding(
-            get: { vm.activeDialog == .restoreConflict },
+            get: { vm.activeDialog == .restoreSameChoice },
+            set: { if !$0 { vm.activeDialog = nil } }
+        )
+    }
+
+    private var restoreNewerChoicePresented: Binding<Bool> {
+        Binding(
+            get: { vm.activeDialog == .restoreNewerChoice },
             set: { if !$0 { vm.activeDialog = nil } }
         )
     }
@@ -112,12 +135,12 @@ struct ContentView: View {
             return Alert(
                 title: Text("还原外置存储数据到 Mac？"),
                 message: Text((vm.restoreNote.map { $0 + "\n\n" } ?? "")
-                    + "来源：外置硬盘上的 WeChatData → 目标：Mac 内置盘原位置。将把外置硬盘上的最新数据搬回 Mac（本地备份仍在时直接改回原名，否则完整拷回）；外置硬盘上的数据保留不动。如微信正在运行，将先自动退出。"),
+                    + "来源：外置硬盘上的 WeChatData → 目标：Mac 内置盘原位置。如微信正在运行，将先自动退出。"),
                 primaryButton: .destructive(Text("确认还原")) { vm.confirmRestore() },
                 secondaryButton: .cancel())
-        case .restoreConflict:
+        case .restoreSameChoice, .restoreNewerChoice:
             // 由 confirmationDialog 呈现（Alert 不支持三个按钮），不会走到这里
-            return Alert(title: Text("外置数据与本地备份不一致"))
+            return Alert(title: Text("还原方式选择"))
         case .backupRestoreConfirm:
             return Alert(
                 title: Text("还原内置存储数据到 Mac？"),

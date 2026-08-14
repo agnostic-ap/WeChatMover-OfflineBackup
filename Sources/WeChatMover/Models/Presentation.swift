@@ -98,7 +98,9 @@ struct StatusCardModel: Identifiable, Equatable {
 
 enum ActiveDialog: String, Identifiable {
     case migrateConfirm, restoreConfirm, backupRestoreConfirm, backupConfirm
-    case restoreConflict   // 外置数据与本地备份不一致（三选项，用 confirmationDialog 呈现）
+    // 三选项弹窗（confirmationDialog 呈现）：
+    case restoreSameChoice    // 外置入口：比对一致，选 内置备份(更快)/仍从外置拷贝
+    case restoreNewerChoice   // 内置入口：外置更新，选 改用外置(推荐)/仍用内置备份
     case existingTarget, cleanExternal
     case error, notice
     var id: String { rawValue }
