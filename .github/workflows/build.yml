@@ -1,0 +1,68 @@
+name: Build macOS App
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and package
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Show toolchain versions
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Run tests
+        run: bash Scripts/test.sh
+
+      - name: Build app
+        run: bash Scripts/build_app.sh
+
+      - name: Package app
+        run: |
+          mkdir -p dist
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/WeChatMover.app \
+            dist/WeChatMover-macOS.zip
+          shasum -a 256 dist/WeChatMover-macOS.zip \
+            > dist/WeChatMover-macOS.zip.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatMover-macOS-${{ github.sha }}
+          path: |
+            dist/WeChatMover-macOS.zip
+            dist/WeChatMover-macOS.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/WeChatMover-macOS.zip \
+            dist/WeChatMover-macOS.zip.sha256 \
+            --title "WeChatMover $GITHUB_REF_NAME" \
+            --generate-notes
