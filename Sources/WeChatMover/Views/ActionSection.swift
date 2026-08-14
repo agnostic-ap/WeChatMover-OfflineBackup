@@ -63,25 +63,13 @@ struct ActionSection: View {
     }
 }
 
-/// 管理行（次级入口，弱化小号按钮）：恢复内置备份 / 还原 / 清理备份 / 清理外置数据。
+/// 管理行（次级入口，弱化小号按钮）：本地备份（占用 + 恢复 + 清理）/ 还原 / 清理外置数据。
 struct ManageSection: View {
     @EnvironmentObject var vm: AppViewModel
 
     var body: some View {
-        if showRestoreBackupsRow || showRestoreRow || !vm.backupItems.isEmpty || vm.hasExternalData {
+        if showRestoreRow || !vm.backupItems.isEmpty || vm.hasExternalData {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-                if showRestoreBackupsRow {
-                    HStack(spacing: DesignTokens.Spacing.xs) {
-                        Image(systemName: "arrow.uturn.backward.circle")
-                            .foregroundStyle(.secondary)
-                        Text("内置备份可恢复（放弃迁移，回到 Mac 上的旧数据）")
-                            .font(.callout)
-                        Spacer()
-                        Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
-                            .controlSize(.small)
-                            .disabled(!vm.canRestoreBackups)
-                    }
-                }
                 if showRestoreRow {
                     HStack(spacing: DesignTokens.Spacing.xs) {
                         Image(systemName: "arrow.uturn.backward")
@@ -94,6 +82,7 @@ struct ManageSection: View {
                             .disabled(!vm.canRestore)
                     }
                 }
+                // 本地备份行：占用大小 +（适用时）恢复 + 清理，同一行承载
                 if !vm.backupItems.isEmpty {
                     HStack(spacing: DesignTokens.Spacing.xs) {
                         Image(systemName: "internaldrive")
@@ -102,6 +91,13 @@ struct ManageSection: View {
                             .font(.callout)
                             .monospacedDigit()
                         Spacer()
+                        // 「恢复内置备份…」是中央主按钮时（backupOnly 状态）这里不重复显示
+                        if showRestoreBackupsButton {
+                            Button("恢复内置备份…") { vm.activeDialog = .backupRestoreConfirm }
+                                .controlSize(.small)
+                                .disabled(!vm.canRestoreBackups)
+                                .help("放弃迁移，回到 Mac 上的旧数据（不需要外置硬盘）")
+                        }
                         Button("清理备份…") { vm.activeDialog = .backupConfirm }
                             .controlSize(.small)
                             .disabled(!vm.canDeleteBackups)
@@ -129,8 +125,8 @@ struct ManageSection: View {
         }
     }
 
-    /// 「恢复内置备份」在主操作位显示时，管理行不重复出现。
-    private var showRestoreBackupsRow: Bool {
+    /// 「恢复内置备份…」是中央主按钮时（backupOnly 状态），行内不重复显示。
+    private var showRestoreBackupsButton: Bool {
         !vm.restorableBackupItems.isEmpty && vm.primaryAction != .restoreBackups
     }
 

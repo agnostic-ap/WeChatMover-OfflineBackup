@@ -1116,6 +1116,7 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     // 断链软链也可恢复（restoreFromBackup 不访问外置盘）
     #expect(vm.restorableBackupItems.count == 1)
     #expect(vm.canRestoreBackups)
+    #expect(vm.canDeleteBackups)   // 备份行仍可清理
     // 主按钮是「恢复内置备份…」
     #expect(vm.primaryAction == .restoreBackups)
 }
