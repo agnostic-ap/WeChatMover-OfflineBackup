@@ -158,11 +158,18 @@ struct ContentView: View {
                 secondaryButton: .cancel())
         case .relocateExecute:
             let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? ""
+            var msg = "将把微信数据（\(size)）转移到：\n\(vm.pendingRelocateBase?.path ?? "")\n\n数据量较大，转移可能需要几分钟到几十分钟，期间请保持硬盘连接、不要打开微信。转移完成并校验通过后，原位置数据会自动清除。"
+            if let fs = vm.pendingRelocateNonAPFS {
+                msg += "\n\n⚠️ 注意：新位置的磁盘格式为 \(fs)，不是 APFS。非 APFS 磁盘可能出现存储膨胀、性能下降等问题，强烈建议改用 APFS 磁盘。"
+            }
             return Alert(
                 title: Text("确认转移微信数据？"),
-                message: Text("将把微信数据（\(size)）转移到：\n\(vm.pendingRelocateBase?.path ?? "")\n\n数据量较大，转移可能需要几分钟到几十分钟，期间请保持硬盘连接、不要打开微信。转移完成并校验通过后，原位置数据会自动清除。"),
+                message: Text(msg),
                 primaryButton: .default(Text("开始转移")) { vm.confirmRelocate() },
-                secondaryButton: .cancel(Text("取消")) { vm.pendingRelocateBase = nil })
+                secondaryButton: .cancel(Text("取消")) {
+                    vm.pendingRelocateBase = nil
+                    vm.pendingRelocateNonAPFS = nil
+                })
         case .restoreConfirm:
             return Alert(
                 title: Text("还原外置存储数据到 Mac？"),

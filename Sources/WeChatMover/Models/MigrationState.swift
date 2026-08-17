@@ -158,9 +158,10 @@ final class AppViewModel: ObservableObject {
 
     /// 迁移按钮是否可用。微信正在运行不再禁用按钮：
     /// 点击后由 requestMigration() 弹确认框引导退出微信。
+    /// 非 APFS 目标卷不禁止（横幅与确认框给强提示）。
     var canMigrate: Bool {
         wechat.isInstalled && !wechat.isAppStoreVersion
-            && !localItems.isEmpty && targetBase != nil && isTargetAPFS
+            && !localItems.isEmpty && targetBase != nil
             && containerReadable && interruptedItems.isEmpty && !isBusy && !isQuittingWeChat
     }
 
@@ -288,9 +289,7 @@ final class AppViewModel: ObservableObject {
         }
         guard brokenItems.isEmpty else { return .blocked(.diskDisconnected) }
         guard targetBase != nil else { return .blocked(.noDestination) }
-        guard isTargetAPFS else {
-            return .blocked(.destinationNotAPFS(targetFSType ?? "未知"))
-        }
+        // 非 APFS 不再阻塞：ready 横幅给强提示，由用户自行决定
         if sizesLoaded, !localItems.isEmpty,
            let free = targetFreeSpace, free < totalLocalSize {
             return .blocked(.insufficientSpace(need: totalLocalSize, free: free))
@@ -308,6 +307,13 @@ final class AppViewModel: ObservableObject {
                 title: "正在检查环境…",
                 message: "正在检测微信安装状态、数据目录与目标磁盘。")
         case .ready:
+            // 非 APFS：不禁止迁移，但横幅给强提示
+            if !isTargetAPFS, let fs = targetFSType {
+                return BannerModel(
+                    tone: .warning, symbol: "exclamationmark.triangle.fill",
+                    title: "目标磁盘不是 APFS 格式",
+                    message: "目标磁盘格式为 \(fs)，非 APFS 磁盘可能出现存储膨胀、性能下降等问题，强烈建议改用 APFS 磁盘。仍要继续可直接点击迁移。将迁移 \(localItems.count) 项数据，共 \(DiskProbe.formatBytes(totalLocalSize))。")
+            }
             return BannerModel(
                 tone: .success, symbol: "checkmark.circle.fill",
                 title: "可以开始迁移",
@@ -372,12 +378,6 @@ final class AppViewModel: ObservableObject {
                 tone: .info, symbol: "externaldrive",
                 title: "选择目标位置",
                 message: "在外置硬盘上选择一个文件夹，用于存放迁移后的微信数据。",
-                fix: .chooseDestination)
-        case .destinationNotAPFS(let fs):
-            return BannerModel(
-                tone: .warning, symbol: "exclamationmark.triangle.fill",
-                title: "目标磁盘格式不受支持",
-                message: "当前格式为 \(fs)，该磁盘格式不受支持，请选择 APFS 格式的磁盘。",
                 fix: .chooseDestination)
         case .insufficientSpace(let need, let free):
             return BannerModel(
@@ -514,11 +514,15 @@ final class AppViewModel: ObservableObject {
             tone: issues.isEmpty ? .success : .warning)
     }
 
-    /// 迁移确认框摘要（规范 6.3：数据大小、目标路径、提醒）。
+    /// 迁移确认框摘要（规范 6.3：数据大小、目标路径、提醒）。非 APFS 附加强警示。
     var migrateConfirmMessage: String {
         let names = localItems.map { Copywriting.itemName($0.subdir) }.joined(separator: "、")
-        return "将迁移 \(names)（共 \(DiskProbe.formatBytes(totalLocalSize))）到 \(targetBase?.path ?? "")。\n\n"
+        var msg = "将迁移 \(names)（共 \(DiskProbe.formatBytes(totalLocalSize))）到 \(targetBase?.path ?? "")。\n\n"
             + "微信将先退出；迁移期间请不要拔出硬盘。"
+        if !isTargetAPFS, let fs = targetFSType {
+            msg += "\n\n⚠️ 注意：目标磁盘格式为 \(fs)，不是 APFS。非 APFS 磁盘可能出现存储膨胀、性能下降等问题，强烈建议改用 APFS 磁盘。"
+        }
+        return msg
     }
 
     // MARK: - 刷新（渐进式并行加载）
@@ -721,21 +725,25 @@ final class AppViewModel: ObservableObject {
         openTargetPanel()
     }
 
-    /// 转移模式下选完新位置：校验（相同位置/APFS/空间）后弹第二重确认。
+    /// 转移的新位置是否为非 APFS（第二重确认框附加强警示用）。
+    var pendingRelocateNonAPFS: String? = nil
+
+    /// 转移模式下选完新位置：校验（相同位置/空间）后弹第二重确认；非 APFS 不禁止但记录警示。
     func applyRelocateSelection(_ url: URL) {
         guard let old = targetBase else { return }
         guard url.path != old.path else {
             notice = "新位置与当前位置相同，无需更改。"
             return
         }
-        if let fs = DiskProbe.volumeFSType(path: url.path), fs.lowercased() != "apfs" {
-            lastError = "新位置的磁盘格式为 \(fs)，仅支持 APFS 格式的磁盘，请重新选择。"
-            return
-        }
         if let need = externalDataSize, need > 0,
            let free = DiskProbe.freeSpace(path: url.path), free < need {
             lastError = "新位置空间不足：需要约 \(DiskProbe.formatBytes(need))，当前可用 \(DiskProbe.formatBytes(free))。"
             return
+        }
+        if let fs = DiskProbe.volumeFSType(path: url.path), !DiskProbe.isAPFS(fsTypeName: fs) {
+            pendingRelocateNonAPFS = fs
+        } else {
+            pendingRelocateNonAPFS = nil
         }
         pendingRelocateBase = url
         activeDialog = .relocateExecute
@@ -750,6 +758,7 @@ final class AppViewModel: ObservableObject {
     func startRelocation() {
         guard let newBase = pendingRelocateBase, let oldBase = targetBase else { return }
         pendingRelocateBase = nil
+        pendingRelocateNonAPFS = nil
         wechat.isRunning = isWeChatRunning()
         guard !wechat.isRunning else {
             lastError = "微信正在运行，请先退出微信再转移。"

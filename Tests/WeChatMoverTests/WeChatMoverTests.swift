@@ -1119,11 +1119,14 @@ private func makePresentationVM() -> AppViewModel {
     #expect(noPerm.appStatus == .blocked(.containerUnreadable))
     #expect(noPerm.banner.fix == .openFullDiskAccess)
 
-    // 非 APFS
+    // 非 APFS：不禁止，ready 状态 + 警示横幅 + 迁移按钮可用
     let exfat = makePresentationVM()
     exfat.targetFSType = "exfat"
-    #expect(exfat.appStatus == .blocked(.destinationNotAPFS("exfat")))
+    #expect(exfat.appStatus == .ready)
+    #expect(exfat.banner.tone == .warning)
     #expect(exfat.banner.message.contains("APFS"))
+    #expect(exfat.canMigrate)
+    #expect(exfat.migrateConfirmMessage.contains("⚠️"))
 
     // 空间不足
     let tight = makePresentationVM()

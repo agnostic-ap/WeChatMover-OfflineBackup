@@ -30,7 +30,6 @@ enum Blocker: Equatable {
     case interruptedResidue
     case diskDisconnected
     case noDestination
-    case destinationNotAPFS(String)
     case insufficientSpace(need: Int64, free: Int64)
 }
 
