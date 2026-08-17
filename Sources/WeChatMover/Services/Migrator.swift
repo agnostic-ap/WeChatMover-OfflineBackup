@@ -303,4 +303,39 @@ enum Migrator {
             throw MigrationError.insufficientSpace(need: totalBytes, free: free)
         }
     }
+
+    // MARK: - 直接使用外置已有数据（收养）
+
+    /// 不拷贝，直接采用外置已有数据：本地源改名 _backup（安全网），建软链指向 target。
+    /// 失败回滚（_backup 改回原名）。源位/目标已是软链、_backup 已存在、目标不存在时拒绝。
+    static func adoptExternalItem(source: URL, target: URL) throws {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: target.path, isDirectory: &isDir), isDir.boolValue,
+              !DiskProbe.isSymlink(target) else {
+            throw MigrationError.sourceMissing(target.path)
+        }
+        guard fm.fileExists(atPath: source.path) else { throw MigrationError.sourceMissing(source.path) }
+        guard !DiskProbe.isSymlink(source) else { throw MigrationError.sourceIsSymlink(source.path) }
+        let backup = backupURL(for: source)
+        guard !fm.fileExists(atPath: backup.path) else {
+            throw MigrationError.backupAlreadyExists(backup.path)
+        }
+
+        do {
+            try fm.moveItem(at: source, to: backup)
+            try fm.createSymbolicLink(at: source, withDestinationURL: target)
+        } catch {
+            try? fm.removeItem(at: source)
+            try? fm.moveItem(at: backup, to: source)
+            throw error
+        }
+
+        // 确认软链可达；异常则整体回滚
+        guard fm.fileExists(atPath: source.path) else {
+            try? fm.removeItem(at: source)
+            try? fm.moveItem(at: backup, to: source)
+            throw MigrationError.verifyFailed("软链创建后目标不可达")
+        }
+    }
 }

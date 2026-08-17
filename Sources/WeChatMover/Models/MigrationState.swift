@@ -997,6 +997,77 @@ final class AppViewModel: ObservableObject {
         log("❌ 删除旧数据失败：\(message)")
     }
 
+    /// 确认框「直接使用外置数据」：冲突项不拷贝——本地改名 _backup 并建软链指向外置已有数据；
+    /// 其余待迁移项继续正常迁移。
+    func adoptExistingTargetsAndMigrate() {
+        guard !conflictingTargetPaths.isEmpty, let base = targetBase else { return }
+        for path in conflictingTargetPaths {
+            guard Self.isConflictPathInsideTarget(path, base: base) else {
+                conflictingTargetPaths = []
+                lastError = "路径不在所选目标目录内，已拒绝使用：\(path)"
+                log("❌ 拒绝使用目标目录外的路径：\(path)")
+                return
+            }
+        }
+        let paths = Set(conflictingTargetPaths)
+        let adopted = localItems.filter {
+            paths.contains(WeChatPaths.targetDirectory(base: base, subdir: $0.subdir).path)
+        }
+        let adoptedBytes = adopted.reduce(Int64(0)) { $0 + $1.size }
+        conflictingTargetPaths = []
+        activeDialog = nil
+        isBusy = true
+        busyKind = .migrating
+        progress = 0
+        log("直接使用外置已有数据（\(adopted.count) 项），本地数据转为备份 …")
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                for item in adopted {
+                    let target = WeChatPaths.targetDirectory(base: base, subdir: item.subdir)
+                    try Migrator.adoptExternalItem(source: item.source, target: target)
+                    await self?.log("✅ 已链接外置数据：\(item.displayName)")
+                }
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.adoptFinished(error: failed, adoptedCount: adopted.count,
+                                      adoptedBytes: adoptedBytes)
+        }
+    }
+
+    private func adoptFinished(error: String?, adoptedCount: Int, adoptedBytes: Int64) {
+        if let error {
+            isBusy = false
+            busyKind = nil
+            migrationOutcome = .failed(error)
+            log("❌ 使用外置数据失败：\(error)")
+            refresh()
+            return
+        }
+        // 被收养的项源位已是软链：就地更新状态，避免 startMigration 因目标已存在再次冲突
+        items = items.map { item in
+            guard item.state == .local, DiskProbe.isSymlink(item.source) else { return item }
+            return ItemStatus(subdir: item.subdir, source: item.source, state: .migrated,
+                              size: item.size, hasBackup: true, backupSize: item.size)
+        }
+        if localItems.isEmpty {
+            // 全部收养完成，无需迁移：直接收尾（重签名 + 指引）
+            isBusy = false
+            busyKind = nil
+            progress = 1
+            migrationOutcome = .succeeded(items: adoptedCount, bytes: adoptedBytes)
+            log("全部数据已链接外置副本，正在重签名微信…")
+            resignWeChat()
+            activeSheet = .guide
+            refresh()
+        } else {
+            // 剩余项继续正常迁移
+            log("其余 \(localItems.count) 项继续正常迁移…")
+            startMigration()
+        }
+    }
+
     func startRestore() {
         guard let base = targetBase else { return }
         // 兜底：确认框打开期间微信又被启动，拒绝还原。

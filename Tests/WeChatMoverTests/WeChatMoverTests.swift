@@ -656,6 +656,106 @@ private func waitUntil(
     #expect(!vm.showExistingTargetConfirm)
 }
 
+// MARK: - 直接使用外置已有数据（收养）
+
+@Test func adoptExternalItemSuccess() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        // 外置已有数据的标记文件
+        try Data(repeating: 9, count: 64).write(to: target.appendingPathComponent("old-marker.bin"))
+
+        try Migrator.adoptExternalItem(source: source, target: target)
+
+        #expect(itemState(at: source) == .migrated)
+        #expect(FileManager.default.fileExists(
+            atPath: WeChatPaths.backupDirectory(for: source).path))   // 本地数据转为备份
+        // 未发生拷贝：外置内容保持原样（标记文件在，源数据没盖过去）
+        #expect(FileManager.default.fileExists(
+            atPath: target.appendingPathComponent("old-marker.bin").path))
+        #expect(DiskProbe.directorySize(at: target) == 64)
+    }
+}
+
+@Test func adoptExternalItemRefusals() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+
+        // 目标不存在
+        #expect(throws: MigrationError.self) {
+            try Migrator.adoptExternalItem(
+                source: source, target: base.appendingPathComponent("WeChatData/nope"))
+        }
+        // _backup 已存在（中断残留）→ 拒绝，源目录不动
+        _ = try makeDataDir(root: root, "container/Documents/xwechat_files_backup",
+                            fileSizes: [32])
+        #expect(throws: MigrationError.self) {
+            try Migrator.adoptExternalItem(source: source, target: target)
+        }
+        #expect(itemState(at: source) == .interrupted)   // 有 _backup 残留，状态不变
+    }
+}
+
+@MainActor @Test func migrationAdoptConflictFlow() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                  fileSizes: [128])
+    let source2 = try makeDataDir(root: root, "container/Documents/app_data",
+                                  fileSizes: [64])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    // 两项外置都已有数据，各放一个标记文件证明没被拷贝覆盖
+    let t1 = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+    let t2 = WeChatPaths.targetDirectory(base: base, subdir: "Documents/app_data")
+    try FileManager.default.createDirectory(at: t1, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: t2, withIntermediateDirectories: true)
+    try Data(repeating: 1, count: 16).write(to: t1.appendingPathComponent("old1.bin"))
+    try Data(repeating: 2, count: 16).write(to: t2.appendingPathComponent("old2.bin"))
+
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source1,
+                   state: .local, size: 128, hasBackup: false, backupSize: 0),
+        ItemStatus(subdir: "Documents/app_data", source: source2,
+                   state: .local, size: 64, hasBackup: false, backupSize: 0),
+    ]
+
+    vm.startMigration()
+    #expect(await waitUntil { vm.showExistingTargetConfirm })
+    #expect(vm.conflictingTargetPaths.count == 2)
+
+    // 选「直接使用外置数据」：两项都变已迁移，不再弹窗，外置内容未被覆盖
+    vm.adoptExistingTargetsAndMigrate()
+    let done = await waitUntil {
+        !vm.isBusy && itemState(at: source1) == .migrated && itemState(at: source2) == .migrated
+    }
+    #expect(done)
+    #expect(vm.lastError == nil)
+    #expect(!vm.showExistingTargetConfirm)
+    #expect(FileManager.default.fileExists(atPath: t1.appendingPathComponent("old1.bin").path))
+    #expect(FileManager.default.fileExists(atPath: t2.appendingPathComponent("old2.bin").path))
+    // 本地数据转为 _backup
+    #expect(FileManager.default.fileExists(
+        atPath: WeChatPaths.backupDirectory(for: source1).path))
+    #expect(FileManager.default.fileExists(
+        atPath: WeChatPaths.backupDirectory(for: source2).path))
+}
+
 @MainActor @Test func resignAppManagementDeniedShowsGuide() async {
     let vm = AppViewModel()
     vm.isAppBundleWritable = { true }

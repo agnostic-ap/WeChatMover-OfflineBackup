@@ -26,6 +26,17 @@ struct ContentView: View {
         // 三选项弹窗用 confirmationDialog（Alert 只支持两个按钮），
         // 仍由 ActiveDialog 单一枚举驱动，这里只是按呈现方式拆绑定。
         .confirmationDialog(
+            "目标位置已有数据",
+            isPresented: existingTargetPresented,
+            titleVisibility: .visible
+        ) {
+            Button("直接使用外置数据（本地数据转为备份）") { vm.adoptExistingTargetsAndMigrate() }
+            Button("删除旧数据并重新迁移", role: .destructive) { vm.removeConflictingTargetAndMigrate() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("以下 \(vm.conflictingTargetPaths.count) 个位置已存在数据，可能来自上次迁移中断或重复迁移：\n\(vm.conflictingTargetPaths.joined(separator: "\n"))\n\n可直接使用外置已有数据（本地数据备份为 _backup，无需拷贝），或删除旧数据后重新迁移（删除不可恢复）。")
+        }
+        .confirmationDialog(
             "外置数据与内置备份一致",
             isPresented: restoreSameChoicePresented,
             titleVisibility: .visible
@@ -55,11 +66,18 @@ struct ContentView: View {
         Binding(
             get: {
                 switch vm.activeDialog {
-                case .restoreSameChoice, .restoreNewerChoice: return nil
+                case .restoreSameChoice, .restoreNewerChoice, .existingTarget: return nil
                 default: return vm.activeDialog
                 }
             },
             set: { vm.activeDialog = $0 }
+        )
+    }
+
+    private var existingTargetPresented: Binding<Bool> {
+        Binding(
+            get: { vm.activeDialog == .existingTarget },
+            set: { if !$0 { vm.activeDialog = nil } }
         )
     }
 
@@ -154,11 +172,8 @@ struct ContentView: View {
                 primaryButton: .destructive(Text("删除")) { vm.deleteAllBackups() },
                 secondaryButton: .cancel())
         case .existingTarget:
-            return Alert(
-                title: Text("目标位置已有数据"),
-                message: Text("以下 \(vm.conflictingTargetPaths.count) 个位置已存在数据，可能来自上次迁移中断或重复迁移：\n\n\(vm.conflictingTargetPaths.joined(separator: "\n"))\n\n删除后不可恢复，确认删除并重新迁移？"),
-                primaryButton: .destructive(Text("删除旧数据并重新迁移")) { vm.removeConflictingTargetAndMigrate() },
-                secondaryButton: .cancel())
+            // 由 confirmationDialog 呈现（三个选项），不会走到这里
+            return Alert(title: Text("目标位置已有数据"))
         case .cleanExternal:
             return Alert(
                 title: Text("清理外置数据？"),
