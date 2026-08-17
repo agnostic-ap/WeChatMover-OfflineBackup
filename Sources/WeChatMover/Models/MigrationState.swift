@@ -813,8 +813,23 @@ final class AppViewModel: ObservableObject {
         isBusy = false
         busyKind = nil
         if let error {
-            migrationOutcome = .failed(error)
-            log("❌ 转移失败：\(error)")
+            // 转移是逐项"先复制、校验后删旧"的：失败时逐项盘点实际位置，
+            // 给用户准确的安抚信息（数据完整）与下一步（可重试续传）。
+            let newRoot = WeChatPaths.targetRoot(forBase: newBase).path
+            let movedCount = items.filter { item in
+                guard let dest = try? FileManager.default
+                    .destinationOfSymbolicLink(atPath: item.source.path) else { return false }
+                return dest.hasPrefix(newRoot)
+            }.count
+            let detail: String
+            if movedCount > 0 {
+                detail = "\(movedCount) 项已转移到新位置，其余仍在原位置；微信数据完整未丢失。检查硬盘连接后重新执行「更改…」可继续转移（已转移的项会自动跳过）。"
+            } else {
+                detail = "微信数据仍保留在原位置，未受影响。请检查硬盘连接后重试。"
+            }
+            migrationOutcome = .failed("\(error)\n\(detail)")
+            log("❌ 转移未完成：\(error)")
+            log("ℹ️ \(detail)")
             refresh()
             return
         }

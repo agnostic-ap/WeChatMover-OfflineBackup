@@ -302,11 +302,13 @@ enum Migrator {
     static func relocateItem(source: URL, newTarget: URL) throws {
         let fm = FileManager.default
         guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
+        let dest = try fm.destinationOfSymbolicLink(atPath: source.path)
+        let oldTarget = URL(fileURLWithPath: dest, isDirectory: true)
+        // 幂等：上次部分完成后的重试，已指向新位置的项直接跳过
+        if oldTarget.path == newTarget.path { return }
         guard !fm.fileExists(atPath: newTarget.path) else {
             throw MigrationError.targetAlreadyExists(newTarget.path)
         }
-        let dest = try fm.destinationOfSymbolicLink(atPath: source.path)
-        let oldTarget = URL(fileURLWithPath: dest, isDirectory: true)
         guard fm.fileExists(atPath: oldTarget.path) else {
             throw MigrationError.sourceMissing(oldTarget.path)
         }
