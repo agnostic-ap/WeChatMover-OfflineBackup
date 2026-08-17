@@ -75,7 +75,7 @@ final class AppViewModel: ObservableObject {
     /// 重签名受阻指引的触发原因（决定文案）。
     @Published var resignGuideReason: ResignGuideReason = .appManagementDenied
     /// 冲突的目标路径（仅供确认框文案与删除用）。
-    @Published var conflictingTargetPath: String? = nil
+    @Published var conflictingTargetPaths: [String] = []
     /// 外置 WeChatData 占用大小（refresh 慢速统计填充；nil = 未统计）。
     @Published var externalDataSize: Int64? = nil
     /// 中性提示弹窗（非失败，如"数据仍在使用中"）。
@@ -924,9 +924,25 @@ final class AppViewModel: ObservableObject {
             if case MigrationError.targetAlreadyExists(let path) = error {
                 // 目标已存在：可能来自上次迁移中断或重复迁移，
                 // 不直接判失败，弹确认框让用户选择删除旧数据后重新迁移。
-                conflictingTargetPath = path
+                // 一次性收集所有冲突项（而非只报第一个），避免逐项弹窗：
+                // 已迁移项（源位已是软链）的目标是本轮新建的，不算冲突。
+                if let base = targetBase {
+                    var all = [path]
+                    for item in localItems {
+                        let t = WeChatPaths.targetDirectory(base: base, subdir: item.subdir).path
+                        guard t != path, !all.contains(t) else { continue }
+                        let isSymlink = (try? FileManager.default
+                            .destinationOfSymbolicLink(atPath: item.source.path)) != nil
+                        if !isSymlink, FileManager.default.fileExists(atPath: t) {
+                            all.append(t)
+                        }
+                    }
+                    conflictingTargetPaths = all
+                } else {
+                    conflictingTargetPaths = [path]
+                }
                 activeDialog = .existingTarget
-                log("⚠️ 目标位置已有数据，可能来自上次迁移中断或重复迁移：\(path)")
+                log("⚠️ 目标位置已有数据（\(conflictingTargetPaths.count) 项），可能来自上次迁移中断或重复迁移：\(conflictingTargetPaths.joined(separator: "、"))")
             } else {
                 migrationOutcome = .failed(error.localizedDescription)
                 log("❌ 迁移失败：\(error.localizedDescription)")
@@ -945,22 +961,28 @@ final class AppViewModel: ObservableObject {
         path.hasPrefix(base.path + "/WeChatData/")
     }
 
-    /// 确认框「删除旧数据并重新迁移」：删掉冲突目标后重跑迁移。
+    /// 确认框「删除旧数据并重新迁移」：删掉全部冲突目标后重跑迁移。
     func removeConflictingTargetAndMigrate() {
-        guard let path = conflictingTargetPath, let base = targetBase else { return }
-        guard Self.isConflictPathInsideTarget(path, base: base) else {
-            conflictingTargetPath = nil
-            lastError = "路径不在所选目标目录内，已拒绝删除：\(path)"
-            log("❌ 拒绝删除目标目录外的路径：\(path)")
-            return
+        guard !conflictingTargetPaths.isEmpty, let base = targetBase else { return }
+        for path in conflictingTargetPaths {
+            guard Self.isConflictPathInsideTarget(path, base: base) else {
+                conflictingTargetPaths = []
+                lastError = "路径不在所选目标目录内，已拒绝删除：\(path)"
+                log("❌ 拒绝删除目标目录外的路径：\(path)")
+                return
+            }
         }
-        conflictingTargetPath = nil
+        let paths = conflictingTargetPaths
+        conflictingTargetPaths = []
+        activeDialog = nil   // 确认后即视为弹窗已关闭（测试环境无 SwiftUI 绑定自动置 nil）
         isBusy = true
         progress = 0
-        log("正在删除旧目标数据：\(path) …")
+        log("正在删除旧目标数据（\(paths.count) 项）…")
         Task.detached { [weak self] in
             do {
-                try FileManager.default.removeItem(atPath: path)
+                for path in paths {
+                    try FileManager.default.removeItem(atPath: path)
+                }
                 await self?.log("✅ 已删除旧数据，重新迁移…")
                 await self?.startMigration()
             } catch {

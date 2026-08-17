@@ -156,7 +156,7 @@ struct ContentView: View {
         case .existingTarget:
             return Alert(
                 title: Text("目标位置已有数据"),
-                message: Text("\(vm.conflictingTargetPath ?? "") 已存在数据，可能来自上次迁移中断或重复迁移。删除后不可恢复，确认删除并重新迁移？"),
+                message: Text("以下 \(vm.conflictingTargetPaths.count) 个位置已存在数据，可能来自上次迁移中断或重复迁移：\n\n\(vm.conflictingTargetPaths.joined(separator: "\n"))\n\n删除后不可恢复，确认删除并重新迁移？"),
                 primaryButton: .destructive(Text("删除旧数据并重新迁移")) { vm.removeConflictingTargetAndMigrate() },
                 secondaryButton: .cancel())
         case .cleanExternal:

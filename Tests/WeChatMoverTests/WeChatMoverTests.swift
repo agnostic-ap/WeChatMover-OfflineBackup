@@ -597,7 +597,7 @@ private func waitUntil(
     // 1. 目标已存在 → 不判失败，弹「删除旧数据并重新迁移」确认框
     vm.startMigration()
     #expect(await waitUntil { vm.showExistingTargetConfirm })
-    #expect(vm.conflictingTargetPath == target.path)
+    #expect(vm.conflictingTargetPaths == [target.path])
     #expect(vm.lastError == nil)
     #expect(vm.logs.contains { $0.contains("目标位置已有数据") })
     #expect(FileManager.default.fileExists(atPath: target.path))   // 旧数据还在
@@ -610,6 +610,50 @@ private func waitUntil(
     #expect(migrated)
     #expect(DiskProbe.directorySize(at: target) == 128)   // 新数据覆盖了旧数据
     #expect(vm.lastError == nil)
+}
+
+@MainActor @Test func migrationMultipleConflictsSingleConfirm() async throws {
+    // 两个迁移项的目标都已存在：只弹一次确认框，一次确认后全部完成
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                  fileSizes: [128])
+    let source2 = try makeDataDir(root: root, "container/Documents/app_data",
+                                  fileSizes: [64])
+    let base = root.appendingPathComponent("external", isDirectory: true)
+    try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+    // 两项都留有旧数据
+    _ = try makeDataDir(root: root, "external/WeChatData/xwechat_files", fileSizes: [32])
+    _ = try makeDataDir(root: root, "external/WeChatData/app_data", fileSizes: [32])
+
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = base
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source1,
+                   state: .local, size: 128, hasBackup: false, backupSize: 0),
+        ItemStatus(subdir: "Documents/app_data", source: source2,
+                   state: .local, size: 64, hasBackup: false, backupSize: 0),
+    ]
+
+    // 一次弹窗收集全部冲突
+    vm.startMigration()
+    #expect(await waitUntil { vm.showExistingTargetConfirm })
+    #expect(vm.conflictingTargetPaths.count == 2)
+
+    // 一次确认 → 两项都迁移完成，不再二次弹窗
+    vm.removeConflictingTargetAndMigrate()
+    let done = await waitUntil {
+        !vm.isBusy && itemState(at: source1) == .migrated && itemState(at: source2) == .migrated
+    }
+    #expect(done)
+    #expect(vm.lastError == nil)
+    #expect(!vm.showExistingTargetConfirm)
 }
 
 @MainActor @Test func resignAppManagementDeniedShowsGuide() async {
