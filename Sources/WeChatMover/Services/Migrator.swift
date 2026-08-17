@@ -295,6 +295,61 @@ enum Migrator {
         }
     }
 
+    // MARK: - 转移已迁移数据到新位置
+
+    /// 已迁移状态下更改目标位置：把数据从旧位置（当前软链指向）转移到 newTarget，
+    /// 然后把软链换指向新位置。拷贝 → 校验 → 换指向 → 删旧数据；失败回滚（软链指回旧位置、删新副本）。
+    static func relocateItem(source: URL, newTarget: URL) throws {
+        let fm = FileManager.default
+        guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
+        guard !fm.fileExists(atPath: newTarget.path) else {
+            throw MigrationError.targetAlreadyExists(newTarget.path)
+        }
+        let dest = try fm.destinationOfSymbolicLink(atPath: source.path)
+        let oldTarget = URL(fileURLWithPath: dest, isDirectory: true)
+        guard fm.fileExists(atPath: oldTarget.path) else {
+            throw MigrationError.sourceMissing(oldTarget.path)
+        }
+        let expectedSize = DiskProbe.directorySize(at: oldTarget)
+        try fm.createDirectory(at: newTarget.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        // 1. 拷贝到新位置
+        do {
+            try fm.copyItem(at: oldTarget, to: newTarget)
+        } catch {
+            try? fm.removeItem(at: newTarget)
+            throw error
+        }
+
+        // 2. 校验
+        guard DiskProbe.directorySize(at: newTarget) == expectedSize else {
+            try? fm.removeItem(at: newTarget)
+            throw MigrationError.verifyFailed(newTarget.path)
+        }
+
+        // 3. 软链换指向新位置；失败回滚（指回旧位置、删新副本）
+        do {
+            try fm.removeItem(at: source)
+            try fm.createSymbolicLink(at: source, withDestinationURL: newTarget)
+        } catch {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: oldTarget)
+            try? fm.removeItem(at: newTarget)
+            throw error
+        }
+
+        // 4. 确认新指向可达；异常回滚
+        guard fm.fileExists(atPath: source.path) else {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: oldTarget)
+            try? fm.removeItem(at: newTarget)
+            throw MigrationError.verifyFailed("软链换指向后目标不可达")
+        }
+
+        // 5. 校验通过后删除旧位置数据
+        try? fm.removeItem(at: oldTarget)
+    }
+
     // MARK: - 前置检查
 
     /// 检查目标卷剩余空间是否装得下这些数据。

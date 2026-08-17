@@ -149,6 +149,20 @@ struct ContentView: View {
                 message: Text(vm.migrateConfirmMessage),
                 primaryButton: .default(Text("退出微信并开始迁移")) { vm.confirmMigration() },
                 secondaryButton: .cancel())
+        case .relocateConfirm:
+            let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? "大小统计中"
+            return Alert(
+                title: Text("更改目标位置？"),
+                message: Text("当前微信数据位于：\n\(vm.targetBase?.path ?? "")\n\n更改后，微信数据（\(size)）将从当前位置完整转移到新目录，期间请不要打开微信或拔出硬盘。确定要更改吗？"),
+                primaryButton: .default(Text("选择新位置…")) { vm.confirmRelocateChoose() },
+                secondaryButton: .cancel())
+        case .relocateExecute:
+            let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? ""
+            return Alert(
+                title: Text("确认转移微信数据？"),
+                message: Text("将把微信数据（\(size)）转移到：\n\(vm.pendingRelocateBase?.path ?? "")\n\n数据量较大，转移可能需要几分钟到几十分钟，期间请保持硬盘连接、不要打开微信。转移完成并校验通过后，原位置数据会自动清除。"),
+                primaryButton: .default(Text("开始转移")) { vm.confirmRelocate() },
+                secondaryButton: .cancel(Text("取消")) { vm.pendingRelocateBase = nil })
         case .restoreConfirm:
             return Alert(
                 title: Text("还原外置存储数据到 Mac？"),

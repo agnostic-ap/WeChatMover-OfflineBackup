@@ -656,6 +656,122 @@ private func waitUntil(
     #expect(!vm.showExistingTargetConfirm)
 }
 
+// MARK: - 转移已迁移数据到新位置
+
+@Test func relocateItemSuccess() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128, 256])
+        let oldBase = root.appendingPathComponent("external", isDirectory: true)
+        let oldTarget = WeChatPaths.targetDirectory(base: oldBase,
+                                                    subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: oldTarget)
+        let backup = WeChatPaths.backupDirectory(for: source)
+        let backupSize = DiskProbe.directorySize(at: backup)
+
+        let newBase = root.appendingPathComponent("external2", isDirectory: true)
+        let newTarget = WeChatPaths.targetDirectory(base: newBase,
+                                                    subdir: "Documents/xwechat_files")
+        try Migrator.relocateItem(source: source, newTarget: newTarget)
+
+        // 软链指向新位置且可达，内容完整；旧位置已删；_backup 不动
+        #expect(itemState(at: source) == .migrated)
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+        #expect(dest == newTarget.path)
+        #expect(DiskProbe.directorySize(at: newTarget) == 384)
+        #expect(!FileManager.default.fileExists(atPath: oldTarget.path))
+        #expect(DiskProbe.directorySize(at: backup) == backupSize)
+    }
+}
+
+@Test func relocateItemRefusals() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let base = root.appendingPathComponent("external", isDirectory: true)
+        let target = WeChatPaths.targetDirectory(base: base, subdir: "Documents/xwechat_files")
+        // 未迁移（源位不是软链）→ 拒绝
+        #expect(throws: MigrationError.self) {
+            try Migrator.relocateItem(source: source, newTarget: target)
+        }
+        // 新目标已存在 → 拒绝
+        try Migrator.migrateItem(source: source, target: target)
+        #expect(throws: MigrationError.self) {
+            try Migrator.relocateItem(source: source, newTarget: target)
+        }
+    }
+}
+
+@MainActor @Test func relocateFlowDoubleConfirm() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
+    }
+
+    let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                  fileSizes: [128])
+    let source2 = try makeDataDir(root: root, "container/Documents/app_data",
+                                  fileSizes: [64])
+    let oldBase = root.appendingPathComponent("external", isDirectory: true)
+    try Migrator.migrateItem(
+        source: source1,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/xwechat_files"))
+    try Migrator.migrateItem(
+        source: source2,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data"))
+
+    let vm = AppViewModel()
+    vm.isWeChatRunning = { false }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { true }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = oldBase
+    vm.externalDataSize = 192
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source1,
+                   state: .migrated, size: 128, hasBackup: true, backupSize: 128),
+        ItemStatus(subdir: "Documents/app_data", source: source2,
+                   state: .migrated, size: 64, hasBackup: true, backupSize: 64),
+    ]
+
+    // 1. 已迁移状态点「更改…」→ 第一重确认（不弹位置选择框）
+    vm.chooseTarget()
+    #expect(vm.activeDialog == .relocateConfirm)
+
+    // 2. 选择与当前相同的位置 → 提示无需更改
+    vm.applyRelocateSelection(oldBase)
+    #expect(vm.notice?.contains("相同") == true)
+    #expect(vm.pendingRelocateBase == nil)
+    vm.notice = nil
+    vm.activeDialog = nil
+
+    // 3. 选择新位置 → 第二重确认
+    let newBase = root.appendingPathComponent("external2", isDirectory: true)
+    try FileManager.default.createDirectory(at: newBase, withIntermediateDirectories: true)
+    vm.applyRelocateSelection(newBase)
+    #expect(vm.pendingRelocateBase == newBase)
+    #expect(vm.activeDialog == .relocateExecute)
+
+    // 4. 确认转移 → 软链换指向、旧位置清除、targetBase 更新
+    vm.confirmRelocate()
+    let done = await waitUntil { !vm.isBusy && vm.targetBase == newBase }
+    #expect(done)
+    #expect(vm.lastError == nil)
+    #expect(itemState(at: source1) == .migrated)
+    #expect(itemState(at: source2) == .migrated)
+    let dest1 = try FileManager.default.destinationOfSymbolicLink(atPath: source1.path)
+    #expect(dest1 == WeChatPaths.targetDirectory(
+        base: newBase, subdir: "Documents/xwechat_files").path)
+    #expect(DiskProbe.directorySize(at: WeChatPaths.targetRoot(forBase: newBase)) == 192)
+    #expect(!FileManager.default.fileExists(
+        atPath: WeChatPaths.targetDirectory(base: oldBase,
+                                            subdir: "Documents/xwechat_files").path))
+    #expect(UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath) == newBase.path)
+}
+
 // MARK: - 直接使用外置已有数据（收养）
 
 @Test func adoptExternalItemSuccess() throws {

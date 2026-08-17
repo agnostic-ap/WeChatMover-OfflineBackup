@@ -14,6 +14,7 @@ enum BusyKind: Equatable {
     case restoringBackups    // 从本地 _backup 还原
     case overwriting         // 用外置数据覆盖内置
     case comparing           // 还原前比对数据新旧
+    case relocating          // 已迁移状态下更改目标位置：数据转移到新目录
     case deletingBackups
     case sizingExternal
     case cleaningExternal
@@ -99,6 +100,8 @@ struct StatusCardModel: Identifiable, Equatable {
 
 enum ActiveDialog: String, Identifiable {
     case migrateConfirm, restoreConfirm, backupRestoreConfirm, backupConfirm
+    case relocateConfirm      // 已迁移状态下点「更改…」：第一重确认（当前位置 + 后果说明）
+    case relocateExecute      // 选完新位置后：第二重确认（大小 + 耗时提示）
     // 三选项弹窗（confirmationDialog 呈现）：
     case restoreSameChoice    // 外置入口：比对一致，选 内置备份(更快)/仍从外置拷贝
     case restoreNewerChoice   // 内置入口：外置更新，选 改用外置(推荐)/仍用内置备份

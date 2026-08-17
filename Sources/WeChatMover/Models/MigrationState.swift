@@ -432,6 +432,13 @@ final class AppViewModel: ObservableObject {
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
                 title: "正在清理外置数据…",
                 message: "删除期间请不要拔出硬盘。")
+        case .relocating:
+            let percent = Int(((progress ?? 0) * 100).rounded())
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在转移微信数据到新位置… \(percent)%",
+                message: "转移期间请不要打开微信或拔出硬盘；完成并校验后原位置数据才会清除。",
+                progress: progress)
         case .quittingWeChat:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -657,6 +664,15 @@ final class AppViewModel: ObservableObject {
     }
 
     func chooseTarget() {
+        // 已迁移状态下「更改…」= 数据转移流程：先弹第一重确认，不直接弹位置选择框
+        guard migratedItems.isEmpty else {
+            activeDialog = .relocateConfirm
+            return
+        }
+        openTargetPanel()
+    }
+
+    private func openTargetPanel() {
         let panel = NSOpenPanel()
         panel.title = "选择外置硬盘上的目标文件夹"
         panel.canChooseFiles = false
@@ -669,7 +685,13 @@ final class AppViewModel: ObservableObject {
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor [weak self] in
-                self?.applyTargetSelection(url)
+                guard let self else { return }
+                if self.isPickingRelocateTarget {
+                    self.isPickingRelocateTarget = false
+                    self.applyRelocateSelection(url)
+                } else {
+                    self.applyTargetSelection(url)
+                }
             }
         }
     }
@@ -684,6 +706,116 @@ final class AppViewModel: ObservableObject {
         if let fs = targetFSType {
             log("目标卷格式：\(fs)，剩余：\(DiskProbe.formatBytes(targetFreeSpace ?? 0))")
         }
+    }
+
+    // MARK: - 转移已迁移数据到新位置
+
+    /// 位置选择是否处于「数据转移」模式（第一重确认后弹出的选择框）。
+    private var isPickingRelocateTarget = false
+    /// 第二重确认框展示用的新位置（确认后才生效并持久化）。
+    @Published var pendingRelocateBase: URL? = nil
+
+    /// 第一重确认「选择新位置…」：进入转移模式并弹位置选择框。
+    func confirmRelocateChoose() {
+        isPickingRelocateTarget = true
+        openTargetPanel()
+    }
+
+    /// 转移模式下选完新位置：校验（相同位置/APFS/空间）后弹第二重确认。
+    func applyRelocateSelection(_ url: URL) {
+        guard let old = targetBase else { return }
+        guard url.path != old.path else {
+            notice = "新位置与当前位置相同，无需更改。"
+            return
+        }
+        if let fs = DiskProbe.volumeFSType(path: url.path), fs.lowercased() != "apfs" {
+            lastError = "新位置的磁盘格式为 \(fs)，仅支持 APFS 格式的磁盘，请重新选择。"
+            return
+        }
+        if let need = externalDataSize, need > 0,
+           let free = DiskProbe.freeSpace(path: url.path), free < need {
+            lastError = "新位置空间不足：需要约 \(DiskProbe.formatBytes(need))，当前可用 \(DiskProbe.formatBytes(free))。"
+            return
+        }
+        pendingRelocateBase = url
+        activeDialog = .relocateExecute
+    }
+
+    /// 第二重确认「开始转移」：先确保微信退出，再执行转移。
+    func confirmRelocate() {
+        quitWeChatIfRunning { [weak self] in self?.startRelocation() }
+    }
+
+    /// 执行转移：逐项 拷贝→校验→软链换指向→删旧数据；全部完成后新位置生效。
+    func startRelocation() {
+        guard let newBase = pendingRelocateBase, let oldBase = targetBase else { return }
+        pendingRelocateBase = nil
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再转移。"
+            log("❌ 转移被拒绝：微信正在运行")
+            return
+        }
+        let todo = migratedItems
+        guard !todo.isEmpty else { return }
+        isBusy = true
+        busyKind = .relocating
+        progress = 0
+        let total = max(todo.reduce(Int64(0)) { $0 + $1.size }, 1)
+        log("开始转移 \(todo.count) 个目录（共 \(DiskProbe.formatBytes(total))）到 \(newBase.path) …")
+
+        // 轮询新位置已拷入的大小作为进度
+        let newRoot = WeChatPaths.targetRoot(forBase: newBase)
+        let poller = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self, await self.isBusy else { return }
+                let done = DiskProbe.directorySize(at: newRoot)
+                await MainActor.run { self.progress = min(Double(done) / Double(total), 0.99) }
+            }
+        }
+
+        Task.detached { [weak self] in
+            var failed: String? = nil
+            do {
+                for item in todo {
+                    let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir)
+                    try Migrator.relocateItem(source: item.source, newTarget: newTarget)
+                    await self?.log("✅ 已转移：\(item.displayName)")
+                }
+                // manifest 跟随数据移动（指纹不变，无需重算）
+                let fm = FileManager.default
+                let oldRoot = WeChatPaths.targetRoot(forBase: oldBase)
+                let oldManifest = oldRoot.appendingPathComponent("manifest.json")
+                if fm.fileExists(atPath: oldManifest.path) {
+                    try? fm.moveItem(at: oldManifest,
+                                     to: newRoot.appendingPathComponent("manifest.json"))
+                }
+                try? fm.removeItem(at: oldRoot)   // 已空则清理；非空（用户自放文件）保留
+            } catch {
+                failed = error.localizedDescription
+            }
+            await self?.relocateFinished(error: failed, newBase: newBase)
+            poller.cancel()
+        }
+    }
+
+    private func relocateFinished(error: String?, newBase: URL) {
+        isBusy = false
+        busyKind = nil
+        if let error {
+            migrationOutcome = .failed(error)
+            log("❌ 转移失败：\(error)")
+            refresh()
+            return
+        }
+        progress = 1
+        // 转移成功：新位置生效并持久化
+        applyTargetSelection(newBase)
+        log("全部数据已转移到新位置，正在重签名微信…")
+        resignWeChat()
+        notice = "转移完成：微信数据已转移到 \(newBase.path)，原位置数据已清除。"
+        refresh()
     }
 
     // MARK: - 迁移 / 还原
