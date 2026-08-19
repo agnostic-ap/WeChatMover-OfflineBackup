@@ -65,7 +65,7 @@
 bash Scripts/build_app.sh
 ```
 
-产物在 `build/WeChatMover.app`（已 ad-hoc 签名），拖到「应用程序」或直接双击运行即可。
+产物在 `build/WeChatMover.app`（arm64 + x86_64 通用包，Apple 芯片与 Intel Mac 均可运行，已 ad-hoc 签名），拖到「应用程序」或直接双击运行即可。
 
 ## 测试
 
