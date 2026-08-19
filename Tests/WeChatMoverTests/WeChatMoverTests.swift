@@ -23,6 +23,14 @@ private func makeDataDir(root: URL, _ relative: String, fileSizes: [Int] = [100,
     return dir
 }
 
+/// 每个测试独立的 UserDefaults suite：并行测试共享 .standard 会互相污染
+/// （targetBasePath 等键），注入独立 suite 彻底隔离。返回 suite 与清理闭包。
+private func makeIsolatedDefaults() -> (defaults: UserDefaults, cleanup: () -> Void) {
+    let name = "WeChatMoverTests-\(UUID().uuidString)"
+    let suite = UserDefaults(suiteName: name)!
+    return (suite, { suite.removePersistentDomain(forName: name) })
+}
+
 // MARK: - 路径模型
 
 @Test func targetPathMapping() {
@@ -384,18 +392,20 @@ func detectRealWeChat() {
 
 // MARK: - 目标选择回调（与 NSOpenPanel 解耦后的纯逻辑）
 
-@MainActor @Test(.serialized) func applyTargetSelectionPersists() throws {
+@MainActor @Test func applyTargetSelectionPersists() throws {
     try withTempDir { root in
         let folder = root.appendingPathComponent("ExtFolder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
         let vm = AppViewModel()
+        vm.defaults = defaults
         vm.applyTargetSelection(folder)
         #expect(vm.targetBase?.path == folder.path)
-        #expect(UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath) == folder.path)
+        #expect(defaults.string(forKey: DefaultsKey.targetBasePath) == folder.path)
         #expect(vm.targetFSType != nil)                       // 卷格式已探测
         #expect(vm.targetFreeSpace != nil)                    // 剩余空间已探测
         #expect(vm.logs.contains { $0.contains("已选择目标位置") })
-        UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
     }
 }
 
@@ -724,15 +734,16 @@ private func waitUntil(
     }
 }
 
-@MainActor @Test(.serialized) func relocatePartialFailureThenRetry() async throws {
+@MainActor @Test func relocatePartialFailureThenRetry() async throws {
     // 模拟"转移中途出问题"：第 2 项的新目标被占位 → 第 1 项已转走、第 2 项失败。
     // 验证：数据完整（各在其位）、提示可重试；排除障碍后重试成功续传。
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let (defaults, cleanup) = makeIsolatedDefaults()
     defer {
         try? FileManager.default.removeItem(at: root)
-        UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
+        cleanup()
     }
 
     let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
@@ -748,6 +759,7 @@ private func waitUntil(
         target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data"))
 
     let vm = AppViewModel()
+    vm.defaults = defaults
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
     vm.signatureVerifier = { .adhoc }
@@ -791,13 +803,14 @@ private func waitUntil(
     #expect(dest2After.hasPrefix(WeChatPaths.targetRoot(forBase: newBase).path))
 }
 
-@MainActor @Test(.serialized) func relocateFlowDoubleConfirm() async throws {
+@MainActor @Test func relocateFlowDoubleConfirm() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let (defaults, cleanup) = makeIsolatedDefaults()
     defer {
         try? FileManager.default.removeItem(at: root)
-        UserDefaults.standard.removeObject(forKey: DefaultsKey.targetBasePath)
+        cleanup()
     }
 
     let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
@@ -813,6 +826,7 @@ private func waitUntil(
         target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data"))
 
     let vm = AppViewModel()
+    vm.defaults = defaults
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
     vm.signatureVerifier = { .adhoc }
@@ -858,7 +872,218 @@ private func waitUntil(
     #expect(!FileManager.default.fileExists(
         atPath: WeChatPaths.targetDirectory(base: oldBase,
                                             subdir: "Documents/xwechat_files").path))
-    #expect(UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath) == newBase.path)
+    #expect(defaults.string(forKey: DefaultsKey.targetBasePath) == newBase.path)
+}
+
+// MARK: - 不转移：改指新位置 / 仅改记录
+
+@Test func repointItemSwitchesWithoutCopy() throws {
+    try withTempDir { root in
+        let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                     fileSizes: [128])
+        let oldBase = root.appendingPathComponent("external", isDirectory: true)
+        let oldTarget = WeChatPaths.targetDirectory(
+            base: oldBase, subdir: "Documents/xwechat_files")
+        try Migrator.migrateItem(source: source, target: oldTarget)
+
+        // 新位置已有数据（用户自己拷的）
+        let newBase = root.appendingPathComponent("external2", isDirectory: true)
+        let newTarget = WeChatPaths.targetDirectory(
+            base: newBase, subdir: "Documents/xwechat_files")
+        try FileManager.default.createDirectory(at: newTarget, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: newTarget.appendingPathComponent("f.bin"))
+
+        try Migrator.repointItem(source: source, newTarget: newTarget)
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+        #expect(dest == newTarget.path)
+        // 旧位置数据保留不删
+        #expect(FileManager.default.fileExists(atPath: oldTarget.path))
+
+        // 幂等：已指向新位置则跳过
+        try Migrator.repointItem(source: source, newTarget: newTarget)
+
+        // 新位置无数据 → 拒绝
+        let missingTarget = WeChatPaths.targetDirectory(
+            base: root.appendingPathComponent("empty", isDirectory: true),
+            subdir: "Documents/xwechat_files")
+        #expect(throws: MigrationError.self) {
+            try Migrator.repointItem(source: source, newTarget: missingTarget)
+        }
+        // 拒绝后指向未变
+        #expect(try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+            == newTarget.path)
+    }
+}
+
+@MainActor @Test func repointFlowFullSuccess() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let (defaults, cleanup) = makeIsolatedDefaults()
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        cleanup()
+    }
+
+    let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                  fileSizes: [128])
+    let source2 = try makeDataDir(root: root, "container/Documents/app_data",
+                                  fileSizes: [64])
+    let oldBase = root.appendingPathComponent("external", isDirectory: true)
+    try Migrator.migrateItem(
+        source: source1,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/xwechat_files"))
+    try Migrator.migrateItem(
+        source: source2,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data"))
+
+    // 新位置已有两项完整数据（用户自行拷入）
+    let newBase = root.appendingPathComponent("external2", isDirectory: true)
+    for subdir in ["Documents/xwechat_files", "Documents/app_data"] {
+        let t = WeChatPaths.targetDirectory(base: newBase, subdir: subdir)
+        try FileManager.default.createDirectory(at: t, withIntermediateDirectories: true)
+        try Data([9]).write(to: t.appendingPathComponent("f.bin"))
+    }
+
+    let vm = AppViewModel()
+    vm.defaults = defaults
+    vm.isWeChatRunning = { false }
+    vm.isAppBundleWritable = { true }
+    final class Flag: @unchecked Sendable { var value = false }
+    let resigned = Flag()
+    vm.resignRunner = { completion in resigned.value = true; completion(.success) }
+    vm.signatureVerifier = { .adhoc }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = oldBase
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source1,
+                   state: .migrated, size: 128, hasBackup: true, backupSize: 128),
+        ItemStatus(subdir: "Documents/app_data", source: source2,
+                   state: .migrated, size: 64, hasBackup: true, backupSize: 64),
+    ]
+
+    // 选新位置 → 弹「改指 / 只改记录」选择框，预检两项都在
+    vm.applyNoTransferSelection(newBase)
+    #expect(vm.activeDialog == .repointChoice)
+    #expect(vm.pendingRepointPresent == 2)
+    #expect(vm.pendingRepointMissing == 0)
+
+    // 直接改指：软链换指向、旧数据保留、targetBase 更新、触发重签名
+    vm.confirmRepoint()
+    #expect(await waitUntil { !vm.isBusy && vm.targetBase == newBase })
+    #expect(vm.lastError == nil)
+    for (source, subdir) in [(source1, "Documents/xwechat_files"), (source2, "Documents/app_data")] {
+        let dest = try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+        #expect(dest == WeChatPaths.targetDirectory(base: newBase, subdir: subdir).path)
+        // 旧位置数据保留未删
+        #expect(FileManager.default.fileExists(
+            atPath: WeChatPaths.targetDirectory(base: oldBase, subdir: subdir).path))
+    }
+    #expect(defaults.string(forKey: DefaultsKey.targetBasePath) == newBase.path)
+    #expect(await waitUntil { resigned.value })
+    #expect(vm.notice?.contains("旧位置数据原样保留") == true)
+}
+
+@MainActor @Test func repointFlowSkipsMissingKeepsRecord() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let (defaults, cleanup) = makeIsolatedDefaults()
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        cleanup()
+    }
+
+    let source1 = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                  fileSizes: [128])
+    let source2 = try makeDataDir(root: root, "container/Documents/app_data",
+                                  fileSizes: [64])
+    let oldBase = root.appendingPathComponent("external", isDirectory: true)
+    try Migrator.migrateItem(
+        source: source1,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/xwechat_files"))
+    try Migrator.migrateItem(
+        source: source2,
+        target: WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data"))
+
+    // 新位置只有第 1 项数据，第 2 项缺失
+    let newBase = root.appendingPathComponent("external2", isDirectory: true)
+    let t1 = WeChatPaths.targetDirectory(base: newBase, subdir: "Documents/xwechat_files")
+    try FileManager.default.createDirectory(at: t1, withIntermediateDirectories: true)
+    try Data([9]).write(to: t1.appendingPathComponent("f.bin"))
+
+    let vm = AppViewModel()
+    vm.defaults = defaults
+    vm.isWeChatRunning = { false }
+    vm.isAppBundleWritable = { true }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { .adhoc }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = oldBase
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source1,
+                   state: .migrated, size: 128, hasBackup: true, backupSize: 128),
+        ItemStatus(subdir: "Documents/app_data", source: source2,
+                   state: .migrated, size: 64, hasBackup: true, backupSize: 64),
+    ]
+
+    vm.applyNoTransferSelection(newBase)
+    #expect(vm.pendingRepointPresent == 1)
+    #expect(vm.pendingRepointMissing == 1)
+    #expect(vm.repointChoiceMessage.contains("缺少 1 项"))
+
+    vm.confirmRepoint()
+    #expect(await waitUntil { !vm.isBusy && vm.notice != nil })
+    // 第 1 项已改指，第 2 项保持原指向；记录维持原位置
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: source1.path)
+        == t1.path)
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: source2.path)
+        == WeChatPaths.targetDirectory(base: oldBase, subdir: "Documents/app_data").path)
+    #expect(vm.targetBase == oldBase)
+    #expect(vm.notice?.contains("未找到数据") == true)
+}
+
+@MainActor @Test func recordOnlyUpdatesTargetWithoutTouchingData() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let (defaults, cleanup) = makeIsolatedDefaults()
+    defer {
+        try? FileManager.default.removeItem(at: root)
+        cleanup()
+    }
+
+    let source = try makeDataDir(root: root, "container/Documents/xwechat_files",
+                                 fileSizes: [128])
+    let oldBase = root.appendingPathComponent("external", isDirectory: true)
+    let oldTarget = WeChatPaths.targetDirectory(
+        base: oldBase, subdir: "Documents/xwechat_files")
+    try Migrator.migrateItem(source: source, target: oldTarget)
+
+    let vm = AppViewModel()
+    vm.defaults = defaults
+    vm.isWeChatRunning = { false }
+    vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
+    vm.targetBase = oldBase
+    vm.items = [
+        ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                   state: .migrated, size: 128, hasBackup: true, backupSize: 128),
+    ]
+
+    let newBase = root.appendingPathComponent("external2", isDirectory: true)
+    try FileManager.default.createDirectory(at: newBase, withIntermediateDirectories: true)
+    vm.applyNoTransferSelection(newBase)
+    #expect(vm.activeDialog == .repointChoice)
+    #expect(vm.pendingRepointPresent == 0)   // 新位置没数据
+    #expect(vm.repointChoiceMessage.contains("未检测到微信数据"))
+
+    vm.confirmRecordOnly()
+    // 只改记录：targetBase 与持久化更新，软链保持原指向，数据不动
+    #expect(vm.targetBase == newBase)
+    #expect(defaults.string(forKey: DefaultsKey.targetBasePath) == newBase.path)
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: source.path)
+        == oldTarget.path)
+    #expect(vm.logs.contains { $0.contains("未改动任何数据与链接") })
 }
 
 // MARK: - 直接使用外置已有数据（收养）

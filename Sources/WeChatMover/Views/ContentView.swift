@@ -26,6 +26,29 @@ struct ContentView: View {
         // 三选项弹窗用 confirmationDialog（Alert 只支持两个按钮），
         // 仍由 ActiveDialog 单一枚举驱动，这里只是按呈现方式拆绑定。
         .confirmationDialog(
+            "更改目标位置",
+            isPresented: relocateConfirmPresented,
+            titleVisibility: .visible
+        ) {
+            Button("转移数据到新位置…") { vm.confirmRelocateChoose() }
+            Button("不转移，只改目标位置…") { vm.confirmNoTransferChoose() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? "大小统计中"
+            Text("当前微信数据位于：\n\(vm.targetBase?.path ?? "")（\(size)）\n\n「转移」会把数据完整拷贝到新位置，校验通过后清除原位置数据（期间请勿打开微信或拔出硬盘）。\n「不转移」不拷贝任何数据，仅切换指向或更新记录，原位置数据保留不动。")
+        }
+        .confirmationDialog(
+            "新位置怎么用？",
+            isPresented: repointChoicePresented,
+            titleVisibility: .visible
+        ) {
+            Button("新位置已有数据，直接改指过去") { vm.confirmRepoint() }
+            Button("只更新记录，数据和链接不动") { vm.confirmRecordOnly() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text(vm.repointChoiceMessage)
+        }
+        .confirmationDialog(
             "目标位置已有数据",
             isPresented: existingTargetPresented,
             titleVisibility: .visible
@@ -61,12 +84,13 @@ struct ContentView: View {
         .sheet(item: $vm.activeSheet, content: sheet)
     }
 
-    /// .alert 绑定：三选项弹窗走 confirmationDialog，这里过滤掉避免双弹。
+    /// .alert 绑定：多选项弹窗走 confirmationDialog，这里过滤掉避免双弹。
     private var alertOnlyDialog: Binding<ActiveDialog?> {
         Binding(
             get: {
                 switch vm.activeDialog {
-                case .restoreSameChoice, .restoreNewerChoice, .existingTarget: return nil
+                case .restoreSameChoice, .restoreNewerChoice, .existingTarget,
+                     .relocateConfirm, .repointChoice: return nil
                 default: return vm.activeDialog
                 }
             },
@@ -78,6 +102,20 @@ struct ContentView: View {
         Binding(
             get: { vm.activeDialog == .existingTarget },
             set: { if !$0 { vm.activeDialog = nil } }
+        )
+    }
+
+    private var relocateConfirmPresented: Binding<Bool> {
+        Binding(
+            get: { vm.activeDialog == .relocateConfirm },
+            set: { if !$0 { vm.activeDialog = nil } }
+        )
+    }
+
+    private var repointChoicePresented: Binding<Bool> {
+        Binding(
+            get: { vm.activeDialog == .repointChoice },
+            set: { if !$0 { vm.cancelRepointChoice() } }
         )
     }
 
@@ -149,13 +187,9 @@ struct ContentView: View {
                 message: Text(vm.migrateConfirmMessage),
                 primaryButton: .default(Text("退出微信并开始迁移")) { vm.confirmMigration() },
                 secondaryButton: .cancel())
-        case .relocateConfirm:
-            let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? "大小统计中"
-            return Alert(
-                title: Text("更改目标位置？"),
-                message: Text("当前微信数据位于：\n\(vm.targetBase?.path ?? "")\n\n更改后，微信数据（\(size)）将从当前位置完整转移到新目录，期间请不要打开微信或拔出硬盘。确定要更改吗？"),
-                primaryButton: .default(Text("选择新位置…")) { vm.confirmRelocateChoose() },
-                secondaryButton: .cancel())
+        case .relocateConfirm, .repointChoice:
+            // 由 confirmationDialog 呈现（Alert 只支持两个按钮），不会走到这里
+            return Alert(title: Text("更改目标位置"))
         case .relocateExecute:
             let size = vm.externalDataSize.map { "约 \(DiskProbe.formatBytes($0))" } ?? ""
             var msg = "将把微信数据（\(size)）转移到：\n\(vm.pendingRelocateBase?.path ?? "")\n\n数据量较大，转移可能需要几分钟到几十分钟，期间请保持硬盘连接、不要打开微信。转移完成并校验通过后，原位置数据会自动清除。"

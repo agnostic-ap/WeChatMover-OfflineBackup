@@ -352,6 +352,38 @@ enum Migrator {
         try? fm.removeItem(at: oldTarget)
     }
 
+    // MARK: - 不转移改指（新位置已有数据，仅换软链指向）
+
+    /// 不拷贝、不删除，仅把软链改指到新位置（要求新位置已有完整数据；旧位置数据保留不动）。
+    /// 失败回滚（指回原位置）。幂等：已指向新位置则跳过。
+    static func repointItem(source: URL, newTarget: URL) throws {
+        let fm = FileManager.default
+        guard DiskProbe.isSymlink(source) else { throw MigrationError.notMigrated(source.path) }
+        let dest = try fm.destinationOfSymbolicLink(atPath: source.path)
+        let oldTarget = URL(fileURLWithPath: dest, isDirectory: true)
+        // 幂等：已指向新位置则跳过
+        if oldTarget.path == newTarget.path { return }
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: newTarget.path, isDirectory: &isDir), isDir.boolValue,
+              !DiskProbe.isSymlink(newTarget) else {
+            throw MigrationError.sourceMissing(newTarget.path)
+        }
+        do {
+            try fm.removeItem(at: source)
+            try fm.createSymbolicLink(at: source, withDestinationURL: newTarget)
+        } catch {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: oldTarget)
+            throw error
+        }
+        // 确认新指向可达；异常回滚
+        guard fm.fileExists(atPath: source.path) else {
+            try? fm.removeItem(at: source)
+            try? fm.createSymbolicLink(at: source, withDestinationURL: oldTarget)
+            throw MigrationError.verifyFailed("软链改指后目标不可达")
+        }
+    }
+
     // MARK: - 前置检查
 
     /// 检查目标卷剩余空间是否装得下这些数据。

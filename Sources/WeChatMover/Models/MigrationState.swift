@@ -117,6 +117,8 @@ final class AppViewModel: ObservableObject {
     }
     /// 退出微信流程（测试可注入假实现，不触碰真实微信）。
     var wechatQuitter: @Sendable () async -> Bool = { await WeChatQuitter.ensureQuit() }
+    /// 偏好存储（测试注入独立 suite，避免并行测试共享 standard 的竞态）。
+    var defaults: UserDefaults = .standard
 
     /// 微信来源展示文案。
     var sourceDescription: String {
@@ -154,7 +156,7 @@ final class AppViewModel: ObservableObject {
     /// 微信版本相对上次签名是否变化（提示需要重签名）。
     var wechatVersionChanged: Bool {
         guard let current = wechat.version else { return false }
-        guard let last = UserDefaults.standard.string(forKey: DefaultsKey.lastSignedVersion) else { return false }
+        guard let last = defaults.string(forKey: DefaultsKey.lastSignedVersion) else { return false }
         return current != last
     }
 
@@ -444,6 +446,11 @@ final class AppViewModel: ObservableObject {
                 title: "正在转移微信数据到新位置… \(percent)%",
                 message: "转移期间请不要打开微信或拔出硬盘；完成并校验后原位置数据才会清除。",
                 progress: progress)
+        case .repointing:
+            return BannerModel(
+                tone: .info, symbol: "arrow.triangle.2.circlepath",
+                title: "正在改指到新位置…",
+                message: "仅切换软链指向，不拷贝数据；期间请不要打开微信。")
         case .quittingWeChat:
             return BannerModel(
                 tone: .info, symbol: "arrow.triangle.2.circlepath",
@@ -547,7 +554,7 @@ final class AppViewModel: ObservableObject {
         isLoading = true
         sizesLoaded = false
         let containerRoot = self.containerRoot
-        let savedTarget = UserDefaults.standard.string(forKey: DefaultsKey.targetBasePath)
+        let savedTarget = defaults.string(forKey: DefaultsKey.targetBasePath)
         if let savedTarget {
             targetBase = URL(fileURLWithPath: savedTarget)
         }
@@ -721,10 +728,14 @@ final class AppViewModel: ObservableObject {
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.isPickingRelocateTarget {
-                    self.isPickingRelocateTarget = false
+                switch self.targetPickMode {
+                case .relocateTransfer:
+                    self.targetPickMode = .initial
                     self.applyRelocateSelection(url)
-                } else {
+                case .relocateNoTransfer:
+                    self.targetPickMode = .initial
+                    self.applyNoTransferSelection(url)
+                case .initial:
                     self.applyTargetSelection(url)
                 }
             }
@@ -734,7 +745,7 @@ final class AppViewModel: ObservableObject {
     /// 选中目标文件夹后的处理（与弹窗解耦，可单测）。
     func applyTargetSelection(_ url: URL) {
         targetBase = url
-        UserDefaults.standard.set(url.path, forKey: DefaultsKey.targetBasePath)
+        defaults.set(url.path, forKey: DefaultsKey.targetBasePath)
         migrationOutcome = nil
         refreshTargetInfo()
         log("已选择目标位置：\(url.path)")
@@ -745,14 +756,26 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - 转移已迁移数据到新位置
 
-    /// 位置选择是否处于「数据转移」模式（第一重确认后弹出的选择框）。
-    private var isPickingRelocateTarget = false
+    /// 位置选择框的用途：初次选择 / 转移数据 / 不转移（改指或仅改记录）。
+    private enum TargetPickMode {
+        case initial, relocateTransfer, relocateNoTransfer
+    }
+    private var targetPickMode: TargetPickMode = .initial
     /// 第二重确认框展示用的新位置（确认后才生效并持久化）。
     @Published var pendingRelocateBase: URL? = nil
+    /// 不转移流程：新位置已存在/缺失数据项数（repointChoice 弹窗文案用）。
+    @Published var pendingRepointPresent = 0
+    @Published var pendingRepointMissing = 0
 
-    /// 第一重确认「选择新位置…」：进入转移模式并弹位置选择框。
+    /// 第一重确认「转移数据到新位置…」：进入转移模式并弹位置选择框。
     func confirmRelocateChoose() {
-        isPickingRelocateTarget = true
+        targetPickMode = .relocateTransfer
+        openTargetPanel()
+    }
+
+    /// 第一重确认「不转移，只改目标位置…」：进入不转移模式并弹位置选择框。
+    func confirmNoTransferChoose() {
+        targetPickMode = .relocateNoTransfer
         openTargetPanel()
     }
 
@@ -783,6 +806,144 @@ final class AppViewModel: ObservableObject {
     /// 第二重确认「开始转移」：先确保微信退出，再执行转移。
     func confirmRelocate() {
         quitWeChatIfRunning { [weak self] in self?.startRelocation() }
+    }
+
+    // MARK: - 不转移：改指新位置 / 仅改记录
+
+    /// 不转移模式下选完新位置：预检新位置各项数据是否已存在，然后弹「改指 / 只改记录」选择框。
+    func applyNoTransferSelection(_ url: URL) {
+        guard let old = targetBase else { return }
+        guard url.path != old.path else {
+            notice = "新位置与当前位置相同，无需更改。"
+            return
+        }
+        var present = 0, missing = 0
+        for item in migratedItems {
+            let t = WeChatPaths.targetDirectory(base: url, subdir: item.subdir)
+            if FileManager.default.fileExists(atPath: t.path) { present += 1 } else { missing += 1 }
+        }
+        pendingRelocateBase = url
+        pendingRepointPresent = present
+        pendingRepointMissing = missing
+        activeDialog = .repointChoice
+    }
+
+    /// 「新位置已有数据，直接改指过去」：先确保微信退出，再换软链指向。
+    func confirmRepoint() {
+        quitWeChatIfRunning { [weak self] in self?.startRepoint() }
+    }
+
+    /// 「只更新记录，数据和链接不动」：仅持久化新目标位置，其他一律不碰。
+    /// 适用于用户已自行完成数据搬迁和链接调整的情况。
+    func confirmRecordOnly() {
+        guard let newBase = pendingRelocateBase else { return }
+        clearPendingRepoint()
+        targetBase = newBase
+        defaults.set(newBase.path, forKey: DefaultsKey.targetBasePath)
+        refreshTargetInfo()
+        log("已更新记录的目标位置：\(newBase.path)（未改动任何数据与链接）")
+        log("⚠️ 提示：当前软链仍指向原位置。如新位置与实际数据位置不符，微信将无法正常读取。")
+        refresh()
+    }
+
+    /// 执行改指：新位置已有数据的项换软链指向；缺数据的项跳过（保持原指向）。
+    /// 全部改指成功才更新记录的目标位置；有跳过/失败则维持原记录，可补齐数据后重试（幂等）。
+    func startRepoint() {
+        guard let newBase = pendingRelocateBase, targetBase != nil else { return }
+        clearPendingRepoint(keepBase: false)
+        wechat.isRunning = isWeChatRunning()
+        guard !wechat.isRunning else {
+            lastError = "微信正在运行，请先退出微信再改指。"
+            log("❌ 改指被拒绝：微信正在运行")
+            return
+        }
+        let todo = migratedItems
+        guard !todo.isEmpty else { return }
+        isBusy = true
+        busyKind = .repointing
+        log("开始改指到新位置（不拷贝数据）：\(newBase.path) …")
+
+        Task.detached { [weak self] in
+            var repointed = 0
+            var skipped: [String] = []
+            var failed: String? = nil
+            for item in todo {
+                let newTarget = WeChatPaths.targetDirectory(base: newBase, subdir: item.subdir)
+                guard FileManager.default.fileExists(atPath: newTarget.path) else {
+                    skipped.append(item.displayName)
+                    await self?.log("⏭ 新位置未找到 \(item.displayName)，保持原指向")
+                    continue
+                }
+                do {
+                    try Migrator.repointItem(source: item.source, newTarget: newTarget)
+                    repointed += 1
+                    await self?.log("✅ 已改指：\(item.displayName)")
+                } catch {
+                    failed = error.localizedDescription
+                    break
+                }
+            }
+            await self?.repointFinished(error: failed, repointed: repointed,
+                                        skipped: skipped, newBase: newBase)
+        }
+    }
+
+    private func repointFinished(error: String?, repointed: Int, skipped: [String], newBase: URL) {
+        isBusy = false
+        busyKind = nil
+        let total = repointed + skipped.count + (error == nil ? 0 : 1)
+        if error == nil && skipped.isEmpty {
+            // 全部改指成功：新位置生效并持久化；旧位置数据保留不动。
+            applyTargetSelection(newBase)
+            log("全部数据已改指到新位置（未拷贝，旧位置数据保留未删），正在重签名微信…")
+            resignWeChat()
+            notice = "改指完成：微信已使用新位置 \(newBase.path) 的数据；旧位置数据原样保留，确认无误后可手动清理。"
+            refresh()
+            return
+        }
+        var parts: [String] = []
+        if repointed > 0 { parts.append("\(repointed) 项已改指新位置") }
+        if !skipped.isEmpty { parts.append("\(skipped.count) 项（\(skipped.joined(separator: "、"))）在新位置未找到数据，仍指原位置") }
+        if let error { parts.append("1 项失败：\(error)") }
+        let summary = parts.joined(separator: "；")
+        if error == nil {
+            // 部分跳过：记录保持原位置，补齐数据后重跑本流程即可续上（已改指的项自动跳过）。
+            notice = "\(summary)。把缺失数据拷到新位置后，重新执行「更改…→ 不转移」即可继续。"
+            log("⚠️ 部分改指：\(summary)")
+        } else {
+            migrationOutcome = .failed("\(error ?? "")\n\(summary)。已改指 \(repointed)/\(total) 项；数据完整未丢失，可重新执行本流程续传。")
+            log("❌ 改指未完成：\(summary)")
+        }
+        refresh()
+    }
+
+    /// repointChoice 弹窗正文：说明两种方式 + 新位置数据预检结果。
+    var repointChoiceMessage: String {
+        let path = pendingRelocateBase?.path ?? ""
+        var msg = "新位置：\n\(path)\n\n"
+        if pendingRepointMissing == 0 {
+            msg += "已在新位置检测到全部 \(pendingRepointPresent) 项微信数据。\n\n"
+        } else if pendingRepointPresent > 0 {
+            msg += "新位置检测到 \(pendingRepointPresent) 项数据，缺少 \(pendingRepointMissing) 项（缺少的项将保持原指向，可补齐后重跑本流程）。\n\n"
+        } else {
+            msg += "⚠️ 新位置未检测到微信数据。\n\n"
+        }
+        msg += "「直接改指」：不拷贝数据，微信立即使用新位置的数据，旧位置数据保留不删（要求新位置的数据完整）。\n"
+            + "「只更新记录」：数据和链接都不动，仅更新工具记录的目标位置——仅当你已自行处理好数据和链接时使用。"
+        return msg
+    }
+
+    /// repointChoice 弹窗取消/关闭：清暂存并关弹窗。
+    func cancelRepointChoice() {
+        clearPendingRepoint()
+        if activeDialog == .repointChoice { activeDialog = nil }
+    }
+
+    /// 清理不转移流程的暂存状态。keepBase=false 时也清掉 pendingRelocateBase。
+    private func clearPendingRepoint(keepBase: Bool = false) {
+        if !keepBase { pendingRelocateBase = nil }
+        pendingRepointPresent = 0
+        pendingRepointMissing = 0
     }
 
     /// 执行转移：逐项 拷贝→校验→软链换指向→删旧数据；全部完成后新位置生效。
@@ -1488,7 +1649,7 @@ final class AppViewModel: ObservableObject {
         switch result {
         case .success:
             if let v = wechat.version {
-                UserDefaults.standard.set(v, forKey: DefaultsKey.lastSignedVersion)
+                defaults.set(v, forKey: DefaultsKey.lastSignedVersion)
             }
             log("✅ 微信重签名完成，正在复核签名…")
             refresh()
