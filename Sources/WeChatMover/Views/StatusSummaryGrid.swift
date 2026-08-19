@@ -44,14 +44,16 @@ struct StatusSummaryGrid: View {
             detailRow("微信来源", Copywriting.sourceName(isAppStoreVersion: vm.wechat.isAppStoreVersion))
             detailRow("微信版本", vm.wechat.version ?? "未安装")
             HStack {
-                detailRow("应用签名", signatureText)
-                if vm.wechat.signatureValid == nil && vm.wechat.isInstalled {
+                detailRow("应用签名", vm.signatureDisplayText)
+                if vm.wechat.signature == nil && vm.wechat.isInstalled {
                     Button("检测") { vm.checkSignatureNow() }.controlSize(.small)
                 }
-                if vm.wechatVersionChanged || vm.wechat.signatureValid == false {
+                if vm.wechat.isInstalled {
+                    // 常驻入口：微信/系统更新后微信打不开时，一键重签名修复
                     Button("重新签名微信") { vm.resignWeChat() }
                         .controlSize(.small)
                         .disabled(vm.isBusy || vm.isResigning)
+                        .help("微信或 macOS 更新后微信无法打开时，点此重新签名修复")
                 }
             }
             detailRow("目标磁盘格式", vm.targetFSType ?? "未选择")
@@ -65,14 +67,6 @@ struct StatusSummaryGrid: View {
             }
         }
         .cardStyle()
-    }
-
-    private var signatureText: String {
-        switch vm.wechat.signatureValid {
-        case .some(true): return "应用签名有效"
-        case .some(false): return "应用签名已失效"
-        case .none: return "未检测"
-        }
     }
 
     private func detailRow(_ title: String, _ value: String) -> some View {

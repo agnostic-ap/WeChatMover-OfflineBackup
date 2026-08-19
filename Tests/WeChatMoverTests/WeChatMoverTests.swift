@@ -384,7 +384,7 @@ func detectRealWeChat() {
 
 // MARK: - 目标选择回调（与 NSOpenPanel 解耦后的纯逻辑）
 
-@MainActor @Test func applyTargetSelectionPersists() throws {
+@MainActor @Test(.serialized) func applyTargetSelectionPersists() throws {
     try withTempDir { root in
         let folder = root.appendingPathComponent("ExtFolder", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -724,7 +724,7 @@ private func waitUntil(
     }
 }
 
-@MainActor @Test func relocatePartialFailureThenRetry() async throws {
+@MainActor @Test(.serialized) func relocatePartialFailureThenRetry() async throws {
     // 模拟"转移中途出问题"：第 2 项的新目标被占位 → 第 1 项已转走、第 2 项失败。
     // 验证：数据完整（各在其位）、提示可重试；排除障碍后重试成功续传。
     let root = FileManager.default.temporaryDirectory
@@ -750,7 +750,7 @@ private func waitUntil(
     let vm = AppViewModel()
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = oldBase
     vm.items = [
@@ -791,7 +791,7 @@ private func waitUntil(
     #expect(dest2After.hasPrefix(WeChatPaths.targetRoot(forBase: newBase).path))
 }
 
-@MainActor @Test func relocateFlowDoubleConfirm() async throws {
+@MainActor @Test(.serialized) func relocateFlowDoubleConfirm() async throws {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -815,7 +815,7 @@ private func waitUntil(
     let vm = AppViewModel()
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = oldBase
     vm.externalDataSize = 192
@@ -993,11 +993,92 @@ private func waitUntil(
     let vm = AppViewModel()
     vm.isAppBundleWritable = { true }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }   // 不扫真实 App
+    vm.signatureVerifier = { .adhoc }   // 不扫真实 App
     vm.resignWeChat()
-    #expect(await waitUntil { vm.wechat.signatureValid == true })
+    #expect(await waitUntil { vm.wechat.signature == .adhoc })
     #expect(!vm.isResigning)
     #expect(vm.logs.contains { $0.contains("签名有效") })
+}
+
+// MARK: - 签名状态三态检测（adhoc / 官方签名 / 失效）
+
+@Test func adhocDescribeOutputParsing() {
+    // ad-hoc 签名（本工具重签后）：Signature=adhoc / flags=0x2(adhoc)
+    let adhoc = """
+    Executable=/Applications/WeChat.app/Contents/MacOS/WeChat
+    Identifier=com.tencent.xinWeChat
+    CodeDirectory v=20400 size=13998 flags=0x2(adhoc) hashes=431+3 location=embedded
+    Signature=adhoc
+    TeamIdentifier=not set
+    """
+    #expect(WeChatDetector.isAdhocDescribeOutput(adhoc))
+
+    // 官方签名（微信更新后恢复）：有 Authority/TeamIdentifier，无 adhoc 标记
+    let official = """
+    Identifier=com.tencent.xinWeChat
+    CodeDirectory v=20400 size=13998 flags=0x0(none) hashes=431+3 location=embedded
+    Authority=Developer ID Application: Tencent Technology (Shenzhen) Company Limited (88L2Q4487U)
+    TeamIdentifier=88L2Q4487U
+    """
+    #expect(!WeChatDetector.isAdhocDescribeOutput(official))
+    #expect(!WeChatDetector.isAdhocDescribeOutput(""))
+}
+
+/// 未签名 fixture → broken；ad-hoc 重签后 → adhoc（真实 codesign，只碰临时目录）。
+@Test func signatureStatusOnFixtureApp() async throws {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("WeChatMoverTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let app = try makeSignableFixtureApp(root: root)
+
+    #expect(WeChatDetector.signatureStatus(appURL: app) == .broken)   // 未签名
+
+    let result: CodeSigner.ResignResult = await withCheckedContinuation { cont in
+        CodeSigner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/codesign"),
+            arguments: ["--sign", "-", "--force", "--deep", app.path]
+        ) { cont.resume(returning: $0) }
+    }
+    #expect(result == .success)
+    #expect(WeChatDetector.signatureStatus(appURL: app) == .adhoc)
+}
+
+@MainActor @Test func checkSignatureNowAppliesStatus() async {
+    let vm = AppViewModel()
+    vm.wechat.isInstalled = true
+    vm.signatureVerifier = { .validOfficial }   // 不扫真实 App
+    vm.checkSignatureNow()
+    #expect(await waitUntil { vm.wechat.signature == .validOfficial })
+}
+
+/// 官方签名 + 已迁移数据 → 安全检查提示需重新签名；未迁移则是正常态。
+@MainActor @Test func officialSignatureOnlyFlaggedWhenMigrated() {
+    let source = URL(fileURLWithPath: "/tmp/fixture-xwechat_files")
+    let vm = AppViewModel()
+    vm.wechat.isInstalled = true
+    vm.wechat.signature = .validOfficial
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .migrated, size: 1, hasBackup: false, backupSize: 0)]
+    #expect(vm.safetyIssues.contains { $0.contains("官方签名") })
+    #expect(vm.signatureDisplayText.contains("需重新签名"))
+
+    vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
+                           state: .local, size: 1, hasBackup: false, backupSize: 0)]
+    #expect(!vm.safetyIssues.contains { $0.contains("官方签名") })
+    #expect(vm.signatureDisplayText == "官方签名")
+}
+
+/// 重签后复核仍是官方签名（签名没生效）→ 日志提示重试，不算成功。
+@MainActor @Test func resignVerifyOfficialSignatureWarns() async {
+    let vm = AppViewModel()
+    vm.isAppBundleWritable = { true }
+    vm.resignRunner = { completion in completion(.success) }
+    vm.signatureVerifier = { .validOfficial }
+    vm.resignWeChat()
+    #expect(await waitUntil { !vm.isResigning && vm.wechat.signature == .validOfficial })
+    #expect(vm.logs.contains { $0.contains("仍是官方签名") })
+    #expect(!vm.logs.contains { $0.contains("复核通过") })
 }
 
 // MARK: - 真实 codesign 直签（只签临时目录 fixture，不碰真实微信）
@@ -1388,7 +1469,7 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     vm.isWeChatRunning = { running.value }
     vm.wechatQuitter = { quitterCalled.value = true; running.value = false; return true }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = base
     vm.wechat.isRunning = true   // 微信运行中
@@ -1420,7 +1501,7 @@ private final class CallFlag: @unchecked Sendable { var value = false }
     let vm = AppViewModel()
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = base
     vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
@@ -1611,7 +1692,7 @@ private func makeRestoreFixture(_ root: URL) throws -> (vm: AppViewModel, source
     let vm = AppViewModel()
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = base
     vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,
@@ -1871,7 +1952,7 @@ private func makeOverwriteFixture(
     let vm = AppViewModel()
     vm.isWeChatRunning = { false }
     vm.resignRunner = { completion in completion(.success) }
-    vm.signatureVerifier = { true }
+    vm.signatureVerifier = { .adhoc }
     vm.containerRoot = root.appendingPathComponent("container", isDirectory: true)
     vm.targetBase = base
     vm.items = [ItemStatus(subdir: "Documents/xwechat_files", source: source,

@@ -111,8 +111,10 @@ final class AppViewModel: ObservableObject {
         CodeSigner.resignWeChat
     /// /Applications/WeChat.app 可写性探测（测试可注入假实现）。
     var isAppBundleWritable: () -> Bool = { CodeSigner.isWritableByCurrentUser() }
-    /// 重签名后的 codesign -v 复核（测试可注入假实现，避免扫真实 App）。
-    var signatureVerifier: @Sendable () -> Bool = { WeChatDetector.checkSignature() }
+    /// 签名状态检测（重签名后复核 / 手动检测共用；测试可注入假实现，避免扫真实 App）。
+    var signatureVerifier: @Sendable () -> WeChatDetector.SignatureStatus = {
+        WeChatDetector.signatureStatus()
+    }
     /// 退出微信流程（测试可注入假实现，不触碰真实微信）。
     var wechatQuitter: @Sendable () async -> Bool = { await WeChatQuitter.ensureQuit() }
 
@@ -256,7 +258,10 @@ final class AppViewModel: ObservableObject {
         if wechat.isAppStoreVersion { issues.append("App Store 版微信不受支持") }
         if !containerReadable { issues.append("需要完全磁盘访问权限") }
         if !interruptedItems.isEmpty { issues.append("存在迁移中断残留") }
-        if wechat.signatureValid == false { issues.append("应用签名已失效") }
+        if wechat.signature == .broken { issues.append("应用签名已失效") }
+        if wechat.signature == .validOfficial && !migratedItems.isEmpty {
+            issues.append("微信已恢复官方签名，需重新签名后才能正常打开")
+        }
         if wechatVersionChanged { issues.append("微信已更新，需要重新签名") }
         return issues
     }
@@ -498,16 +503,25 @@ final class AppViewModel: ObservableObject {
                                iconUsesAccent: true)
     }
 
+    /// 签名状态展示文案（安全卡片与安全详情共用）。
+    var signatureDisplayText: String {
+        switch wechat.signature {
+        case .some(.adhoc):
+            return "应用签名有效"
+        case .some(.validOfficial):
+            // 官方签名对未迁移用户是正常态；已迁移数据则必须重签才能打开。
+            return migratedItems.isEmpty ? "官方签名" : "官方签名 · 需重新签名"
+        case .some(.broken):
+            return "应用签名已失效"
+        case .none:
+            return "签名未检测"
+        }
+    }
+
     private var safetyCard: StatusCardModel {
         let issues = safetyIssues
         let value = isLoading ? "检查中…" : (issues.isEmpty ? "全部通过" : "\(issues.count) 项待处理")
-        let signature: String
-        switch wechat.signatureValid {
-        case .some(true): signature = "应用签名有效"
-        case .some(false): signature = "应用签名已失效"
-        case .none: signature = "签名未检测"
-        }
-        let detail = "微信 \(wechat.version ?? "—") · \(signature)"
+        let detail = "微信 \(wechat.version ?? "—") · \(signatureDisplayText)"
         return StatusCardModel(
             id: "safety", title: "安全检查", value: value, detail: detail,
             symbol: issues.isEmpty ? "checkmark.shield.fill" : "exclamationmark.shield.fill",
@@ -601,12 +615,23 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    /// 是否在 XCTest 下运行（自动签名检测在测试中跳过，避免扫真实 App）。
+    private static var isRunningTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+    }
+
     private func applyWeChat(_ info: WeChatInfo) {
         // 保留已检测过的签名状态（refresh 不清空手动检测结果）
         var info = info
-        info.signatureValid = wechat.signatureValid
+        info.signature = wechat.signature
         wechat = info
         isLoading = false
+        // 首次加载或检测到微信已更新时，自动后台复检签名：
+        // 更新会恢复官方签名，只验封条会误判"签名有效"，必须看是否仍是 ad-hoc。
+        if !Self.isRunningTests, wechat.isInstalled,
+           wechat.signature == nil || wechatVersionChanged {
+            checkSignatureNow()
+        }
     }
 
     private func applyDiskInfo(homeFree: Int64?, targetFSType fs: String?, targetFree: Int64?) {
@@ -629,18 +654,24 @@ final class AppViewModel: ObservableObject {
         externalDataSize = size
     }
 
-    /// 手动触发签名校验（codesign --verify 要扫整个 App，较慢，后台执行）。
+    /// 签名检测是否进行中（防重入：codesign 扫整个 App 较慢，避免刷新叠加多个扫描）。
+    private var signatureCheckInFlight = false
+
+    /// 手动触发签名检测（codesign 要扫整个 App，较慢，后台执行）。
     func checkSignatureNow() {
-        guard wechat.isInstalled else { return }
-        wechat.signatureValid = nil
+        guard wechat.isInstalled, !signatureCheckInFlight else { return }
+        signatureCheckInFlight = true
+        wechat.signature = nil
+        let verifier = signatureVerifier
         Task.detached { [weak self] in
-            let ok = WeChatDetector.checkSignature()
-            await self?.applySignature(ok)
+            let status = verifier()
+            await self?.applySignature(status)
         }
     }
 
-    private func applySignature(_ ok: Bool) {
-        wechat.signatureValid = ok
+    private func applySignature(_ status: WeChatDetector.SignatureStatus) {
+        signatureCheckInFlight = false
+        wechat.signature = status
     }
 
     private nonisolated static func resolvingSymlink(_ url: URL) -> URL {
@@ -1461,11 +1492,11 @@ final class AppViewModel: ObservableObject {
             }
             log("✅ 微信重签名完成，正在复核签名…")
             refresh()
-            // 签名后自动 codesign -v 复核，结果回日志。
+            // 签名后自动复核，结果回日志。
             let verifier = signatureVerifier
             Task.detached { [weak self] in
-                let ok = verifier()
-                await self?.resignVerified(ok)
+                let status = verifier()
+                await self?.resignVerified(status)
             }
         case .appManagementDenied(let detail):
             // TCC「App 管理」权限缺失：弹授权指引（含终端兜底命令）。
@@ -1479,11 +1510,14 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func resignVerified(_ ok: Bool) {
-        wechat.signatureValid = ok
-        if ok {
-            log("✅ 签名有效（codesign -v 复核通过）")
-        } else {
+    private func resignVerified(_ status: WeChatDetector.SignatureStatus) {
+        wechat.signature = status
+        switch status {
+        case .adhoc:
+            log("✅ 签名有效（codesign 复核通过，ad-hoc 签名）")
+        case .validOfficial:
+            log("⚠️ 复核：签名校验通过但仍是官方签名，请重试重签名")
+        case .broken:
             log("⚠️ 重签名后复核仍未通过，请重试；或按指引在终端执行兜底命令")
         }
     }
