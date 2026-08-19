@@ -42,13 +42,13 @@ jobs:
           mkdir -p dist
           ditto -c -k --sequesterRsrc --keepParent \
             build/WeChatMover.app \
-            dist/WeChatMover-macOS.zip
+            dist/WeChatMover-macOS-universal.zip
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: WeChatMover-macOS-${{ github.sha }}
-          path: dist/WeChatMover-macOS.zip
+          name: WeChatMover-macOS-universal-${{ github.sha }}
+          path: dist/WeChatMover-macOS-universal.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -58,6 +58,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            dist/WeChatMover-macOS.zip \
+            dist/WeChatMover-macOS-universal.zip \
             --title "WeChatMover $GITHUB_REF_NAME" \
             --generate-notes
