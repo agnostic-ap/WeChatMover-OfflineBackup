@@ -1,24 +1,30 @@
 import SwiftUI
+import AppKit
 
 /// 仪表盘根视图：PageHeader → ReadinessBanner → 摘要卡片 → 目标选择器
-/// → 单一主操作区 → 可折叠日志。View 只消费展示模型。
+/// → 单一主操作区 → 可折叠日志；窗口底部固定 GitHub 链接条。
+/// View 只消费展示模型。
 struct ContentView: View {
     @EnvironmentObject var vm: AppViewModel
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: DesignTokens.Spacing.lg) {
-                pageHeader
-                ReadinessBanner(model: vm.banner)
-                StatusSummaryGrid()
-                DestinationPickerRow()
-                ActionSection()
-                ManageSection()
-                LogDisclosureGroup()
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: DesignTokens.Spacing.lg) {
+                    pageHeader
+                    ReadinessBanner(model: vm.banner)
+                    StatusSummaryGrid()
+                    DestinationPickerRow()
+                    ActionSection()
+                    ManageSection()
+                    LogDisclosureGroup()
+                }
+                .padding(DesignTokens.Spacing.xl)
+                .frame(maxWidth: 960)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(DesignTokens.Spacing.xl)
-            .frame(maxWidth: 960)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            Divider()
+            githubFooter
         }
         .background(DesignTokens.Colors.background)
         .toolbar { toolbarItems }
@@ -143,6 +149,37 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
         }
     }
+
+    /// 窗口底部固定的 GitHub 仓库链接（mark 为模板渲染，深浅色自适应）。
+    private var githubFooter: some View {
+        Button {
+            NSWorkspace.shared.open(URL(string: "https://github.com/pipipiper/WeChatMover")!)
+        } label: {
+            HStack(spacing: 6) {
+                if let mark = Self.githubMark {
+                    Image(nsImage: mark)
+                        .resizable()
+                        .frame(width: 14, height: 14)
+                }
+                Text("github.com/pipipiper/WeChatMover")
+                    .font(.caption)
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, DesignTokens.Spacing.xs)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("在 GitHub 上查看源码与使用指南")
+    }
+
+    /// GitHub mark（黑色透明底，模板渲染后跟随前景色）。
+    private static let githubMark: NSImage? = {
+        guard let url = Bundle.main.url(forResource: "GitHub-Mark", withExtension: "png"),
+              let img = NSImage(contentsOf: url) else { return nil }
+        img.isTemplate = true
+        return img
+    }()
 
     /// Toolbar 右侧：刷新（图标 + Tooltip）、帮助。
     @ToolbarContentBuilder

@@ -25,6 +25,7 @@ cp "build/WeChatMover-universal" "$APP/Contents/MacOS/WeChatMover"
 rm "build/WeChatMover-universal"   # 中间产物，并入 .app 后删除
 cp "Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+cp "Resources/GitHub-Mark.png" "$APP/Contents/Resources/GitHub-Mark.png"
 
 echo "==> ad-hoc 签名"
 codesign --force --sign - "$APP"
