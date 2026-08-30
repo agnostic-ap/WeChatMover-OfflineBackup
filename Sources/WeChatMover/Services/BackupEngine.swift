@@ -99,19 +99,54 @@ enum BackupEngine {
             let src = request.environment.url(for: component)
             let archiveName = component.id + ".zip"
             let archiveURL = workDir.appendingPathComponent(archiveName)
+
+            // 容器组件先整树克隆到容器外再归档（见 ContainerCloner 注释）；
+            // 应用本体不在容器内，直接归档。克隆失败则退回直接归档。
+            var archiveSource = src
+            var cloneParent: URL? = nil
+            defer { if let cloneParent { ContainerCloner.removeClone(cloneParent) } }
+            var entryStats = stats[component.id] ?? (0, 0)
+            if component.kind != .application {
+                let parent = ContainerCloner.makeCloneParent()
+                let need = ContainerCloner.estimatedCloneOverhead(fileCount: entryStats.fileCount)
+                let free = DiskProbe.freeSpace(path: fm.temporaryDirectory.path) ?? .max
+                if free > need {
+                    do {
+                        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                        let cloneRoot = parent.appendingPathComponent(
+                            src.lastPathComponent, isDirectory: true)
+                        try ContainerCloner.cloneTree(source: src, to: cloneRoot, log: log)
+                        for name in ContainerCloner.pruneProtectedFiles(inCloneRoot: cloneRoot) {
+                            log("已剔除受系统保护的元数据文件：\(name)（恢复后系统自动重建）")
+                        }
+                        cloneParent = parent
+                        archiveSource = cloneRoot
+                        // 用克隆重新统计：与归档实际内容严格一致。
+                        entryStats = FileStats.measure(at: cloneRoot)
+                    } catch {
+                        ContainerCloner.removeClone(parent)
+                        let msg = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                        log("⚠️ 容器外克隆失败（\(msg)），改为直接归档原目录（大容器可能明显变慢）")
+                    }
+                } else {
+                    log("⚠️ 本地空间不足以克隆（需约 \(DiskProbe.formatBytes(need))），改为直接归档原目录")
+                }
+            }
+
             log("归档 \(component.displayName)…")
             do {
-                try ZipArchiver.createZip(source: src, archive: archiveURL)
+                try ZipArchiver.createZip(source: archiveSource, archive: archiveURL)
                 // 打包后自检：条目安全且都在期望顶层目录下。
                 let list = try ZipArchiver.listEntries(archive: archiveURL)
-                try ZipArchiver.validateEntries(list, expectedTopLevel: src.lastPathComponent)
+                try ZipArchiver.validateEntries(
+                    list, expectedTopLevel: archiveSource.lastPathComponent)
             } catch {
                 try cleanupAndThrow(error)
             }
             // 归档完成后复查：本组件归档期间微信重开，内容不可信，
             // 即便是唯一/最后一个组件也整体作废，不生成快照。
             if isWeChatRunning() { try cleanupAndThrow(BackupError.wechatStillRunning) }
-            let s = stats[component.id] ?? (0, 0)
+            let s = entryStats
             let archiveSize = (try? fm.attributesOfItem(atPath: archiveURL.path)[.size] as? Int64)
                 .flatMap { $0 } ?? 0
             let sha: String

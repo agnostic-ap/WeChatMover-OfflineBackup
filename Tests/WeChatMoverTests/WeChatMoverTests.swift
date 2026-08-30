@@ -1103,3 +1103,108 @@ func runProcessSurvivesHugeStderrOutput() {
     #expect(out.count < 1400)
     #expect(out.contains("已截断"))
 }
+
+// MARK: - 容器外克隆（ContainerCloner）
+
+@Test func cloneTreePreservesContentXattrAndSymlink() throws {
+    try withTempDir { root in
+        let src = try makeDataDir(root: root, "com.tencent.xinWeChat", fileSizes: [64, 128])
+        // xattr + 符号链接 + 根层受保护 plist
+        let f = src.appendingPathComponent("file0.bin")
+        let val = Data("克隆保真".utf8)
+        _ = val.withUnsafeBytes { setxattr(f.path, "com.wcm.test", $0.baseAddress, val.count, 0, 0) }
+        try FileManager.default.createSymbolicLink(
+            atPath: src.appendingPathComponent("link").path,
+            withDestinationPath: "file0.bin")
+        try Data("protected".utf8).write(
+            to: src.appendingPathComponent(".com.apple.containermanagerd.metadata.plist"))
+
+        let parent = root.appendingPathComponent(ContainerCloner.clonePrefix + "t", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        let clone = parent.appendingPathComponent("com.tencent.xinWeChat", isDirectory: true)
+        try ContainerCloner.cloneTree(source: src, to: clone)
+        let pruned = ContainerCloner.pruneProtectedFiles(inCloneRoot: clone)
+
+        #expect(pruned == [".com.apple.containermanagerd.metadata.plist"])
+        #expect(!FileManager.default.fileExists(
+            atPath: clone.appendingPathComponent(".com.apple.containermanagerd.metadata.plist").path))
+        // 源里的 plist 分毫未动
+        #expect(FileManager.default.fileExists(
+            atPath: src.appendingPathComponent(".com.apple.containermanagerd.metadata.plist").path))
+        // 内容、xattr、符号链接均保真
+        #expect(try Data(contentsOf: clone.appendingPathComponent("file0.bin"))
+                == Data(repeating: 1, count: 64))
+        var buf = [UInt8](repeating: 0, count: 32)
+        let n = getxattr(clone.appendingPathComponent("file0.bin").path, "com.wcm.test", &buf, buf.count, 0, 0)
+        #expect(Data(buf.prefix(max(n, 0))) == val)
+        let dest = try FileManager.default.destinationOfSymbolicLink(
+            atPath: clone.appendingPathComponent("link").path)
+        #expect(dest == "file0.bin")
+    }
+}
+
+@Test func cloneTreeRetriesOnInterruptedThenGivesUp() throws {
+    try withTempDir { root in
+        let src = try makeDataDir(root: root, "s")
+        let dst = root.appendingPathComponent("d")
+        // 前两次 EINTR，第三次成功
+        var calls = 0
+        try ContainerCloner.cloneTree(source: src, to: dst, cloneOp: { from, to in
+            calls += 1
+            if calls < 3 { throw ContainerCloner.CloneError.interrupted }
+            try ContainerCloner.systemCloneFile(from, to)
+        })
+        #expect(calls == 3)
+        #expect(FileManager.default.fileExists(atPath: dst.appendingPathComponent("file0.bin").path))
+
+        // 一直 EINTR → 到达上限后抛出
+        var always = 0
+        #expect(throws: ContainerCloner.CloneError.interrupted) {
+            try ContainerCloner.cloneTree(
+                source: src, to: root.appendingPathComponent("d2"),
+                maxAttempts: 3, cloneOp: { _, _ in always += 1; throw ContainerCloner.CloneError.interrupted })
+        }
+        #expect(always == 3)
+    }
+}
+
+@Test func removeCloneHandlesReadOnlyDirsAndRefusesForeignPaths() throws {
+    try withTempDir { root in
+        // 带只读子目录的克隆目录：能删干净
+        let clone = root.appendingPathComponent(ContainerCloner.clonePrefix + "x", isDirectory: true)
+        let ro = try makeDataDir(root: clone, "readonly")
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: ro.path)
+        ContainerCloner.removeClone(clone)
+        #expect(!FileManager.default.fileExists(atPath: clone.path))
+
+        // 无克隆前缀的目录：拒绝删除
+        let foreign = try makeDataDir(root: root, "not-a-clone")
+        ContainerCloner.removeClone(foreign)
+        #expect(FileManager.default.fileExists(atPath: foreign.path))
+    }
+}
+
+@Test func backupExcludesProtectedPlistViaClone() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let mainDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
+        try Data("protected".utf8).write(
+            to: mainDir.appendingPathComponent(".com.apple.containermanagerd.metadata.plist"))
+
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
+        let manifest = try #require(snapshot.manifest)
+        let main = try #require(manifest.entries.first { $0.id == "container-com.tencent.xinWeChat" })
+        // 归档与清单都不含受保护 plist（fixture 主容器只有 2 个数据文件）
+        #expect(main.fileCount == 2)
+        let entries = try ZipArchiver.listEntries(
+            archive: snapshot.directoryURL.appendingPathComponent(main.archiveName))
+        #expect(!entries.contains { $0.contains("containermanagerd") })
+        // 源目录里的 plist 原样保留
+        #expect(FileManager.default.fileExists(
+            atPath: mainDir.appendingPathComponent(".com.apple.containermanagerd.metadata.plist").path))
+        // （克隆临时目录的清理由 removeClone 单测与引擎 defer 覆盖；
+        //   并行测试各自有进行中的克隆，不能对全局临时目录做无残留断言。）
+    }
+}
