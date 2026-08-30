@@ -82,6 +82,13 @@ enum BackupEngine {
         // 第一次写盘前复查微信确实没在运行（防退出后立即重开的竞态）。
         guard !isWeChatRunning() else { throw BackupError.wechatStillRunning }
         try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
+        // 禁止 Spotlight 索引备份仓库：给几十 GB 归档建索引既无意义，
+        // 还会和备份写入抢 I/O（加剧系统压力）。
+        let noIndex = VaultStore.vaultRoot(base: request.vaultBase)
+            .appendingPathComponent(".metadata_never_index")
+        if !fm.fileExists(atPath: noIndex.path) {
+            fm.createFile(atPath: noIndex.path, contents: Data())
+        }
 
         // 之后任何失败都清掉本次新建的工作目录（只删自己刚建的 .inprogress）。
         func cleanupAndThrow(_ error: Error) throws -> Never {

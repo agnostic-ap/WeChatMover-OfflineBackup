@@ -169,7 +169,7 @@ final class AppViewModel: ObservableObject {
             self.appendLog("开始备份到 \(base.path)")
             let log = self.backgroundLogger()
             let prog = self.backgroundProgress()
-            let result: Result<SnapshotInfo, Error> = await Task.detached(priority: .userInitiated) {
+            let result: Result<SnapshotInfo, Error> = await Task.detached(priority: .utility) {
                 do {
                     return .success(try BackupEngine.performBackup(
                         request, log: log, progress: prog,
@@ -197,7 +197,7 @@ final class AppViewModel: ObservableObject {
         busy = .planningRestore
         let version = wechat.version
         Task { [weak self] in
-            let result: Result<RestorePlan, Error> = await Task.detached(priority: .userInitiated) {
+            let result: Result<RestorePlan, Error> = await Task.detached(priority: .utility) {
                 do {
                     return .success(try RestoreEngine.makePlan(
                         snapshot: snapshot,
@@ -249,7 +249,7 @@ final class AppViewModel: ObservableObject {
             self.appendLog("开始恢复快照 \(plan.snapshot.name)")
             let log = self.backgroundLogger()
             let prog = self.backgroundProgress()
-            let result: Result<RestoreResult, Error> = await Task.detached(priority: .userInitiated) {
+            let result: Result<RestoreResult, Error> = await Task.detached(priority: .utility) {
                 do {
                     return .success(try RestoreEngine.performRestore(
                         plan: plan, environment: .live,
@@ -288,7 +288,7 @@ final class AppViewModel: ObservableObject {
         progress = nil
         let log = backgroundLogger()
         Task { [weak self] in
-            let problems = await Task.detached(priority: .userInitiated) {
+            let problems = await Task.detached(priority: .utility) {
                 VaultStore.verify(snapshot: snapshot, log: log)
             }.value
             guard let self else { return }

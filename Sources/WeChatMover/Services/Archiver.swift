@@ -103,6 +103,9 @@ enum Archiver {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
+        // utility QoS：归档工具的大流量 I/O 交给系统节流，避免和内核/其他
+        // 进程抢到系统失去响应（实测全速 45GB 读写曾触发 watchdog 重启）。
+        process.qualityOfService = .utility
         let outPipe = Pipe()
         let errPipe = Pipe()
         process.standardOutput = outPipe

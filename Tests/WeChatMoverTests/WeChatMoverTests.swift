@@ -488,7 +488,7 @@ private func runRestore(
         #expect(VaultStore.listSnapshots(base: vault).isEmpty)
         let rootEntries = (try? FileManager.default.contentsOfDirectory(
             atPath: VaultStore.vaultRoot(base: vault).path)) ?? []
-        #expect(rootEntries.isEmpty)
+        #expect(rootEntries.filter { $0 != ".metadata_never_index" }.isEmpty)
     }
 }
 
@@ -997,7 +997,7 @@ private struct TestMoveError: Error, Equatable { let tag: String }
         // 中止后不留 .inprogress 残留
         let entries = (try? FileManager.default.contentsOfDirectory(
             atPath: VaultStore.vaultRoot(base: vault).path)) ?? []
-        #expect(entries.isEmpty)
+        #expect(entries.filter { $0 != ".metadata_never_index" }.isEmpty)
     }
 }
 
@@ -1048,7 +1048,7 @@ private struct TestMoveError: Error, Equatable { let tag: String }
         // 本次 .inprogress 已删除，不生成快照
         let entries = (try? FileManager.default.contentsOfDirectory(
             atPath: VaultStore.vaultRoot(base: vault).path)) ?? []
-        #expect(entries.isEmpty)
+        #expect(entries.filter { $0 != ".metadata_never_index" }.isEmpty)
         #expect(VaultStore.listSnapshots(base: vault).isEmpty)
     }
 }
@@ -1235,5 +1235,18 @@ func runProcessSurvivesHugeStderrOutput() {
             atPath: mainDir.appendingPathComponent(".com.apple.containermanagerd.metadata.plist").path))
         // （克隆临时目录的清理由 removeClone 单测与引擎 defer 覆盖；
         //   并行测试各自有进行中的克隆，不能对全局临时目录做无残留断言。）
+    }
+}
+
+@Test func backupWritesSpotlightNoIndexMarker() throws {
+    // 备份仓库根必须带 .metadata_never_index，阻止 Spotlight 给几十 GB
+    // 归档建索引、与备份写入抢 I/O。
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        _ = try runBackup(makeBackupRequest(env: env, vault: vault))
+        #expect(FileManager.default.fileExists(
+            atPath: VaultStore.vaultRoot(base: vault)
+                .appendingPathComponent(".metadata_never_index").path))
     }
 }
