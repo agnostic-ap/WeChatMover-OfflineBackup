@@ -1074,3 +1074,32 @@ private struct TestMoveError: Error, Equatable { let tag: String }
         #expect(FileStats.measure(at: fpDir) == fpBefore)
     }
 }
+
+// MARK: - 子进程大量 stderr 输出不得死锁（回归：ditto 警告灌满管道缓冲）
+
+@Test(.timeLimit(.minutes(1)))
+func runProcessSurvivesHugeStderrOutput() {
+    // 向 stderr 写约 200KB（远超 64KB 管道缓冲）后正常输出 stdout 并退出。
+    // 旧的双管道顺序读实现会在此死锁；文件重定向实现应正常返回。
+    let script = """
+    i=0
+    while [ $i -lt 8000 ]; do
+      echo "warning line $i with some padding text" 1>&2
+      i=$((i+1))
+    done
+    echo OK
+    """
+    let result = ZipArchiver.runProcess("/bin/sh", ["-c", script])
+    #expect(result.status == 0)
+    #expect(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "OK")
+    #expect(result.stderr.contains("warning line 7999"))
+}
+
+@Test func truncatedForDisplayLimitsLongText() {
+    let short = "短消息"
+    #expect(ZipArchiver.truncatedForDisplay(short) == short)
+    let long = String(repeating: "警告行\n", count: 2000)
+    let out = ZipArchiver.truncatedForDisplay(long)
+    #expect(out.count < 1400)
+    #expect(out.contains("已截断"))
+}

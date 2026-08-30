@@ -14,7 +14,8 @@ enum ZipArchiver {
             "-c", "-k", "--sequesterRsrc", "--keepParent", source.path, archive.path,
         ])
         guard result.status == 0 else {
-            throw BackupError.archiveFailed("ditto 打包退出码 \(result.status)：\(result.stderr)")
+            throw BackupError.archiveFailed(
+                "ditto 打包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
         }
     }
 
@@ -22,7 +23,8 @@ enum ZipArchiver {
     static func extractZip(archive: URL, to directory: URL) throws {
         let result = runProcess(dittoPath, ["-x", "-k", archive.path, directory.path])
         guard result.status == 0 else {
-            throw BackupError.archiveFailed("ditto 解包退出码 \(result.status)：\(result.stderr)")
+            throw BackupError.archiveFailed(
+                "ditto 解包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
         }
     }
 
@@ -70,26 +72,52 @@ enum ZipArchiver {
         var stderr: String
     }
 
+    /// 子进程输出一律重定向到临时文件，退出后再读取。
+    /// 不能用 Pipe：ditto 遇到问题文件会向 stderr 连续输出警告，
+    /// 一旦灌满 64KB 管道缓冲而读取方还在等另一条管道的 EOF，
+    /// 双方互等造成死锁（大容量备份实测踩中）。文件重定向无此问题。
     static func runProcess(_ path: String, _ arguments: [String]) -> ProcessResult {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory
+        let outURL = tmp.appendingPathComponent("wcm-proc-\(UUID().uuidString).out")
+        let errURL = tmp.appendingPathComponent("wcm-proc-\(UUID().uuidString).err")
+        fm.createFile(atPath: outURL.path, contents: nil)
+        fm.createFile(atPath: errURL.path, contents: nil)
+        defer {
+            try? fm.removeItem(at: outURL)
+            try? fm.removeItem(at: errURL)
+        }
+        guard let outHandle = try? FileHandle(forWritingTo: outURL),
+              let errHandle = try? FileHandle(forWritingTo: errURL) else {
+            return ProcessResult(status: -1, stdout: "", stderr: "无法创建临时输出文件")
+        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
-        let outPipe = Pipe()
-        let errPipe = Pipe()
-        process.standardOutput = outPipe
-        process.standardError = errPipe
+        process.standardOutput = outHandle
+        process.standardError = errHandle
         do {
             try process.run()
         } catch {
+            try? outHandle.close()
+            try? errHandle.close()
             return ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
         }
-        // 先读到 EOF 再等退出，避免大输出填满管道缓冲导致死锁。
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        try? outHandle.close()
+        try? errHandle.close()
+        let outData = (try? Data(contentsOf: outURL)) ?? Data()
+        let errData = (try? Data(contentsOf: errURL)) ?? Data()
         return ProcessResult(
             status: process.terminationStatus,
             stdout: String(data: outData, encoding: .utf8) ?? "",
             stderr: String(data: errData, encoding: .utf8) ?? "")
+    }
+
+    /// 错误消息用的 stderr 截断（警告可能有几万行，弹窗只展示开头）。
+    static func truncatedForDisplay(_ text: String, limit: Int = 1200) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        return trimmed.prefix(limit) + "\n…（已截断，共 \(trimmed.count) 字符）"
     }
 }
