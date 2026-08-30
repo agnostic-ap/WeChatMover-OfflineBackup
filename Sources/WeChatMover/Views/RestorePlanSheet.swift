@@ -66,7 +66,7 @@ struct RestorePlanSheet: View {
 
         // 执行前检查摘要
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.xxs) {
-            checkRow("恢复前逐个校验 ZIP 路径安全与 SHA-256", ok: true)
+            checkRow("恢复前逐个校验归档条目安全与 SHA-256", ok: true)
             checkRow("需要空间约 \(DiskProbe.formatBytes(plan.totalLogicalSize))，本机剩余 \(plan.freeSpaceOnHome.map(DiskProbe.formatBytes) ?? "未知")",
                      ok: (plan.freeSpaceOnHome ?? 0) > plan.totalLogicalSize)
             checkRow("当前微信版本 \(plan.currentWeChatVersion ?? "未安装") / 快照版本 \(plan.backupWeChatVersion ?? "未知")",

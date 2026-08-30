@@ -30,7 +30,7 @@ struct RestoreResult: Sendable {
     var rollbackDirs: [String]
 }
 
-/// 恢复核心：验证（ZIP 路径安全 + SHA-256）→ 空间检查 → 全部解压到暂存 →
+/// 恢复核心：验证（归档条目路径安全 + SHA-256）→ 空间检查 → 全部解压到暂存 →
 /// 原目录改名为回滚副本 → 暂存落位；任一步失败自动回滚，绝不静默删除用户数据。
 /// 同步实现，由调用方放到后台线程执行。
 enum RestoreEngine {
@@ -133,8 +133,8 @@ enum RestoreEngine {
         // 1. 逐归档验证：条目路径安全 + 顶层结构 + SHA-256。全部通过前不动任何数据。
         for (i, item) in plan.items.enumerated() {
             log("验证归档 \(item.entry.displayName)…")
-            let entries = try ZipArchiver.listEntries(archive: item.archiveURL)
-            try ZipArchiver.validateEntries(
+            let entries = try Archiver.listEntries(archive: item.archiveURL)
+            try Archiver.validateEntries(
                 entries, expectedTopLevel: item.targetURL.lastPathComponent)
             let sha = try Checksum.sha256(of: item.archiveURL)
             guard sha == item.entry.sha256 else {
@@ -171,7 +171,7 @@ enum RestoreEngine {
                 try? fm.removeItem(at: stagingDir)   // 同名残留暂存（带 staging 标记）可清
                 try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
                 log("解压 \(item.entry.displayName)…")
-                try ZipArchiver.extractZip(archive: item.archiveURL, to: stagingDir)
+                try Archiver.extractArchive(archive: item.archiveURL, to: stagingDir)
             } catch {
                 cleanupStaging()
                 throw error

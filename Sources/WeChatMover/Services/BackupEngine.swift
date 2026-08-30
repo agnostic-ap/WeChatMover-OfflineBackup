@@ -14,7 +14,7 @@ struct BackupRequest: Sendable {
     var spaceMargin: Int64 = 256 << 20
 }
 
-/// 备份核心：逐组件 ditto ZIP → SHA-256 → 写清单 → 写完成标记 → 目录去掉
+/// 备份核心：逐组件 tar 归档 → SHA-256 → 写清单 → 写完成标记 → 目录去掉
 /// .inprogress 后缀。全程只读微信数据；对备份盘只写快照目录。
 /// 同步实现，由调用方放到后台线程执行。
 enum BackupEngine {
@@ -65,7 +65,7 @@ enum BackupEngine {
             log("统计 \(component.displayName)：\(s.fileCount) 个文件，\(DiskProbe.formatBytes(s.logicalSize))")
         }
 
-        // 2. 目标盘空间预检（ZIP 通常更小，用逻辑大小作保守上界 + 余量）。
+        // 2. 目标盘空间预检（tar 不压缩，按逻辑大小 + 余量）。
         if let free = DiskProbe.freeSpace(path: request.vaultBase.path),
            free < totalLogical + request.spaceMargin {
             throw BackupError.insufficientSpace(need: totalLogical + request.spaceMargin, free: free)
@@ -97,7 +97,7 @@ enum BackupEngine {
             // 每个组件归档前复查：微信中途被打开会导致归档内容不一致。
             if isWeChatRunning() { try cleanupAndThrow(BackupError.wechatStillRunning) }
             let src = request.environment.url(for: component)
-            let archiveName = component.id + ".zip"
+            let archiveName = component.id + ".tar"
             let archiveURL = workDir.appendingPathComponent(archiveName)
 
             // 容器组件先整树克隆到容器外再归档（见 ContainerCloner 注释）；
@@ -135,10 +135,10 @@ enum BackupEngine {
 
             log("归档 \(component.displayName)…")
             do {
-                try ZipArchiver.createZip(source: archiveSource, archive: archiveURL)
+                try Archiver.createArchive(source: archiveSource, archive: archiveURL)
                 // 打包后自检：条目安全且都在期望顶层目录下。
-                let list = try ZipArchiver.listEntries(archive: archiveURL)
-                try ZipArchiver.validateEntries(
+                let list = try Archiver.listEntries(archive: archiveURL)
+                try Archiver.validateEntries(
                     list, expectedTopLevel: archiveSource.lastPathComponent)
             } catch {
                 try cleanupAndThrow(error)

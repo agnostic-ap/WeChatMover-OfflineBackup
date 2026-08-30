@@ -66,11 +66,11 @@ struct StatusHeaderSection: View {
         .cardStyle()
     }
 
-    /// exFAT 等格式友好提示：归档为 ZIP 单文件，任何格式都安全。
+    /// exFAT 等格式友好提示：归档为 tar 单文件，任何格式都安全。
     private var fsTypeLabel: String {
         guard let fs = vm.vaultFSType else { return "格式未知" }
         if fs.lowercased() == "exfat" {
-            return "exFAT（兼容，备份以 ZIP 归档存放，安全）"
+            return "exFAT（兼容，备份以 tar 归档存放，安全）"
         }
         return fs
     }

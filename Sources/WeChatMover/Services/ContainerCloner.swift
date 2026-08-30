@@ -6,7 +6,7 @@ import Darwin
 ///
 /// 为什么需要：macOS 26 对「逐文件访问其他 App 容器」有逐文件系统审查，
 /// 大批量读取时每个文件都被拖慢，且高负载下随机超时返回 EINTR，导致
-/// ditto 直接归档容器又慢又必然失败（实测 45GB 容器无法完成）。
+/// 直接归档容器又慢又必然失败（实测 45GB 容器无法完成）。
 /// 整树 clonefile 只需一次调用，7 秒即可克隆 45GB；克隆位于容器外，
 /// 后续归档不再受审查，快 15 倍且零错误。
 enum ContainerCloner {
@@ -125,7 +125,7 @@ enum ContainerCloner {
         guard fm.fileExists(atPath: directory.path) else { return }
         if (try? fm.removeItem(at: directory)) != nil { return }
         // 只读目录挡路：递归解除后重删。
-        _ = ZipArchiver.runProcess("/bin/chmod", ["-R", "u+w", directory.path])
+        _ = Archiver.runProcess("/bin/chmod", ["-R", "u+w", directory.path])
         try? fm.removeItem(at: directory)
     }
 

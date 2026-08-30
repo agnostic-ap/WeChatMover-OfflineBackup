@@ -270,7 +270,7 @@ final class AppViewModel: ObservableObject {
                         + "\n确认微信一切正常后，可在对应目录手动删除这些副本以释放空间。"
                 }
                 if plan.appEntry != nil {
-                    msg += "\n\n快照内含 WeChat.app 归档，不会自动安装。如需同版本微信，请手动解压快照中的 app-WeChat.zip 并拖入「应用程序」。"
+                    msg += "\n\n快照内含 WeChat.app 归档，不会自动安装。如需同版本微信，请手动解压快照中的 app-WeChat.tar 并拖入「应用程序」。"
                 }
                 self.notice = msg
                 self.activeDialog = .notice

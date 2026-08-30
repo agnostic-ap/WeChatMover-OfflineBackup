@@ -18,11 +18,11 @@ struct BackupManifest: Codable, Equatable, Sendable {
         var kind: BackupComponent.Kind
         var displayName: String
         var relativePath: String          // 源相对路径（application 为相对根 "/"）
-        var archiveName: String           // 快照目录内的 ZIP 文件名
+        var archiveName: String           // 快照目录内的 归档文件名
         var fileCount: Int
         var logicalSize: Int64            // 源目录逻辑大小（字节）
-        var archiveSize: Int64            // ZIP 文件大小（字节）
-        var sha256: String                // ZIP 的 SHA-256（小写十六进制）
+        var archiveSize: Int64            // 归档文件大小（字节）
+        var sha256: String                // 归档的 SHA-256（小写十六进制）
     }
 
     /// 参与自动恢复的条目（微信应用本体归档只作保存，不自动恢复）。

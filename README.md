@@ -33,14 +33,14 @@ macOS / SwiftUI 的**微信数据离线整包备份与恢复工具**。完全退
 ```
 <你选择的文件夹>/WeChatBackups/
   WeChatBackup-20260830-153000/
-    container-com.tencent.xinWeChat.zip
-    container-com.tencent.xinWeChat.WeChatMacShare.zip
+    container-com.tencent.xinWeChat.tar
+    container-com.tencent.xinWeChat.WeChatMacShare.tar
     …
     manifest.json          # 清单
     COMPLETE               # 完成标记（内容 = manifest.json 的 SHA-256）
 ```
 
-- **归档**：系统 `ditto -c -k --sequesterRsrc --keepParent`。ZIP 单文件封装 macOS 扩展属性与资源叉（AppleDouble/`__MACOSX` 机制），因此**裸目录永不直接落上 exFAT**，元数据不丢；解包用 `ditto -x -k` 自动还原。
+- **归档**：系统 bsdtar（`tar -cf … --mac-metadata`）。tar 单文件以 AppleDouble 机制封装 macOS 扩展属性与资源叉，因此**裸目录永不直接落上 exFAT**，元数据不丢；解包 `tar -xpf --mac-metadata` 自动还原，且 libarchive 默认拒绝绝对路径与 `..` 穿越条目。不用 ditto ZIP：ditto 对 >4GB 归档写不出标准 ZIP64（实测 45GB 归档被 zipinfo/bsdtar 判为损坏），且 tar 免压缩打包快约 8 倍（微信数据多为已压缩媒体，ZIP 也压不动）。
 - **manifest.json** 记录：格式版本、创建时间、工具版本、微信版本/build、macOS 版本，以及每个归档的源相对路径、文件数、逻辑大小、归档大小、SHA-256。
 - **完成标记**：所有归档与清单落盘后才写 `COMPLETE`；标记缺失或与清单哈希不符的快照显示为「未完成/损坏」，禁止用于恢复。备份过程写在 `*.inprogress` 目录中，成功后才改名。
 - **仓库位置防呆**：备份仓库不得与任何源组件目录相同、位于其内部或包含源目录（比较时解析符号链接），否则直接拒绝，杜绝递归归档或把源写进仓库。
@@ -51,7 +51,7 @@ macOS / SwiftUI 的**微信数据离线整包备份与恢复工具**。完全退
 1. **默认只出计划**：展示每项的目标路径、大小、是否会让位现有数据，以及微信版本/磁盘空间检查结果；版本不一致必须勾选知情确认。
 2. **二次确认**：计划页确认后还有最终 destructive 确认。
 3. **清单白名单校验**：manifest 的 `archiveName` 必须是快照目录内的安全直接文件名，`relativePath` 必须精确映射到微信组件白名单（拒绝重复目标、重复归档名、空自动恢复项）——恶意或损坏的清单无法把恢复引导到白名单之外。
-4. **先验证再动手**：逐归档校验 ZIP 条目路径安全（拒绝绝对路径、`..`、越出顶层目录）与 SHA-256；再检查磁盘空间。全部通过前不写一个字节；落位前还会最后复查微信未运行。
+4. **先验证再动手**：逐归档校验条目路径安全（拒绝绝对路径、`..`、越出顶层目录）与 SHA-256；再检查磁盘空间。全部通过前不写一个字节；落位前还会最后复查微信未运行。
 5. **先解压后落位**：全部解压到目标同级的 `*.wcm-staging-*` 暂存目录（同卷，落位仅是改名）。
 6. **原数据只改名，绝不静默删除**：现有目录改名为 `<原名>.wcm-rollback-<时间戳>` 保留原位；确认无误后由用户手动删除。
 7. **失败自动回滚，回滚失败不掩盖**：任一步失败，已落位的新数据改名让位（`.wcm-failed-*`），回滚副本改回原名。若回滚本身也出错，工具不会谎称已恢复：抛出明确的严重错误，逐条列出原数据所在的 `.wcm-rollback-*` 路径与失败副本路径，且保证全程未删除任何数据。
@@ -76,7 +76,7 @@ bash Scripts/build_app.sh   # 出 arm64 + x86_64 通用 WeChatMover.app（ad-hoc
 ```
 Sources/WeChatMover/
   Models/     BackupComponents（组件发现 + PathGuard 白名单）、BackupManifest、AppViewModel、Presentation
-  Services/   ZipArchiver（ditto/zipinfo）、Checksum（SHA-256）、VaultStore（快照仓库）、
+  Services/   Archiver（bsdtar tar + --mac-metadata）、Checksum（SHA-256）、VaultStore（快照仓库）、
               BackupEngine、RestoreEngine、WeChatDetector、WeChatQuitter、DiskProbe、PermissionHelper
   Views/      SwiftUI 中文界面（备份区、快照列表、恢复计划、快照详情、日志）
 ```

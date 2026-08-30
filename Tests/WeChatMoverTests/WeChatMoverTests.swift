@@ -207,7 +207,7 @@ private func runRestore(
         "a\\..\\b",                 // 反斜杠
         "weird/..",                 // 结尾上跳
     ]
-    let unsafe = ZipArchiver.unsafeEntries(entries)
+    let unsafe = Archiver.unsafeEntries(entries)
     #expect(unsafe.sorted() == [
         "/etc/passwd", "../escape.txt", "a/../../b.txt", "a\\..\\b", "weird/..", "~root/x",
     ].sorted())
@@ -216,11 +216,11 @@ private func runRestore(
 @Test func validateEntriesRejectsStrayTopLevel() throws {
     // 顶层目录之外的条目（可能覆盖任意同级目录）→ 拒绝
     #expect(throws: BackupError.self) {
-        try ZipArchiver.validateEntries(["expected/a.txt", "other/b.txt"],
+        try Archiver.validateEntries(["expected/a.txt", "other/b.txt"],
                                         expectedTopLevel: "expected")
     }
     // 正常结构 + __MACOSX 伴生目录 → 通过
-    try ZipArchiver.validateEntries(
+    try Archiver.validateEntries(
         ["expected", "expected/a.txt", "__MACOSX/expected/._a.txt"],
         expectedTopLevel: "expected")
 }
@@ -248,9 +248,9 @@ private func runRestore(
     }
 }
 
-// MARK: - ditto ZIP 往返（含扩展属性）
+// MARK: - tar 归档往返（含扩展属性）
 
-@Test func zipRoundTripPreservesContentAndXattr() throws {
+@Test func archiveRoundTripPreservesContentAndXattr() throws {
     try withTempDir { dir in
         let src = try makeDataDir(root: dir, "payload", fileSizes: [128, 256])
         let fileWithXattr = src.appendingPathComponent("file0.bin")
@@ -261,19 +261,19 @@ private func runRestore(
         }
         #expect(setResult == 0)
 
-        let archive = dir.appendingPathComponent("payload.zip")
-        try ZipArchiver.createZip(source: src, archive: archive)
+        let archive = dir.appendingPathComponent("payload.tar")
+        try Archiver.createArchive(source: src, archive: archive)
         #expect(FileManager.default.fileExists(atPath: archive.path))
 
         // 条目列出且全部安全、位于顶层目录内
-        let entries = try ZipArchiver.listEntries(archive: archive)
+        let entries = try Archiver.listEntries(archive: archive)
         #expect(!entries.isEmpty)
-        try ZipArchiver.validateEntries(entries, expectedTopLevel: "payload")
+        try Archiver.validateEntries(entries, expectedTopLevel: "payload")
 
         // 解包到别处，内容与 xattr 均还原
         let out = dir.appendingPathComponent("out", isDirectory: true)
         try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
-        try ZipArchiver.extractZip(archive: archive, to: out)
+        try Archiver.extractArchive(archive: archive, to: out)
         let restored = out.appendingPathComponent("payload/file0.bin")
         #expect(try Data(contentsOf: restored) == Data(repeating: 1, count: 128))
 
@@ -298,12 +298,12 @@ private func runRestore(
             .init(id: "container-com.tencent.xinWeChat", kind: .container,
                   displayName: "微信主容器（聊天记录与文件）",
                   relativePath: "Library/Containers/com.tencent.xinWeChat",
-                  archiveName: "container-com.tencent.xinWeChat.zip",
+                  archiveName: "container-com.tencent.xinWeChat.tar",
                   fileCount: 42, logicalSize: 1234, archiveSize: 999, sha256: "ab" ),
             .init(id: "app-WeChat", kind: .application,
                   displayName: "微信应用本体（WeChat.app）",
                   relativePath: "Applications/WeChat.app",
-                  archiveName: "app-WeChat.zip",
+                  archiveName: "app-WeChat.tar",
                   fileCount: 10, logicalSize: 100, archiveSize: 90, sha256: "cd"),
         ])
     let decoded = try BackupManifest.decode(manifest.encoded())
@@ -375,7 +375,7 @@ private func runRestore(
 
         // 破坏一个归档 → 验证报大小与 SHA-256 问题
         let archive = snapshot.directoryURL
-            .appendingPathComponent("container-com.tencent.xinWeChat.zip")
+            .appendingPathComponent("container-com.tencent.xinWeChat.tar")
         var data = try Data(contentsOf: archive)
         data.append(contentsOf: [0xde, 0xad])
         try data.write(to: archive)
@@ -596,7 +596,7 @@ private func runRestore(
 
         // 篡改归档
         let archive = snapshot.directoryURL
-            .appendingPathComponent("container-com.tencent.xinWeChat.zip")
+            .appendingPathComponent("container-com.tencent.xinWeChat.tar")
         var data = try Data(contentsOf: archive)
         data[data.count - 1] ^= 0xff
         try data.write(to: archive)
@@ -731,15 +731,15 @@ private func rewriteManifest(
 // MARK: - 清单白名单校验（恶意 manifest）
 
 @Test func manifestArchiveNameValidation() {
-    #expect(ManifestValidation.archiveNameProblem("container-x.zip") == nil)
-    #expect(ManifestValidation.archiveNameProblem("../evil.zip") != nil)
-    #expect(ManifestValidation.archiveNameProblem("sub/evil.zip") != nil)
-    #expect(ManifestValidation.archiveNameProblem("a\\b.zip") != nil)
-    #expect(ManifestValidation.archiveNameProblem(".hidden.zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem("container-x.tar") == nil)
+    #expect(ManifestValidation.archiveNameProblem("../evil.tar") != nil)
+    #expect(ManifestValidation.archiveNameProblem("sub/evil.tar") != nil)
+    #expect(ManifestValidation.archiveNameProblem("a\\b.tar") != nil)
+    #expect(ManifestValidation.archiveNameProblem(".hidden.tar") != nil)
     #expect(ManifestValidation.archiveNameProblem("..") != nil)
     #expect(ManifestValidation.archiveNameProblem("") != nil)
     #expect(ManifestValidation.archiveNameProblem("noext") != nil)
-    #expect(ManifestValidation.archiveNameProblem(".zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem(".tar") != nil)
 }
 
 @Test func manifestRelativePathValidation() {
@@ -786,8 +786,8 @@ private func rewriteManifest(
         }
 
         // archiveName 穿越 / 带子路径
-        try expectPlanRejected { $0.entries[0].archiveName = "../../evil.zip" }
-        try expectPlanRejected { $0.entries[0].archiveName = "sub/evil.zip" }
+        try expectPlanRejected { $0.entries[0].archiveName = "../../evil.tar" }
+        try expectPlanRejected { $0.entries[0].archiveName = "sub/evil.tar" }
         // relativePath 指向白名单之外
         try expectPlanRejected { $0.entries[0].relativePath = "Desktop/com.tencent.xinWeChat" }
         try expectPlanRejected {
@@ -806,7 +806,7 @@ private func rewriteManifest(
                 id: "app-WeChat", kind: .application,
                 displayName: "微信应用本体（WeChat.app）",
                 relativePath: "Applications/WeChat.app",
-                archiveName: "app-WeChat.zip",
+                archiveName: "app-WeChat.tar",
                 fileCount: 1, logicalSize: 1, archiveSize: 1, sha256: "00")]
         }
 
@@ -826,7 +826,7 @@ private func rewriteManifest(
         let good = try runBackup(makeBackupRequest(env: env, vault: vault))
 
         let bad = try rewriteManifest(good) {
-            $0.entries[0].archiveName = "../evil.zip"
+            $0.entries[0].archiveName = "../evil.tar"
             $0.entries[1].relativePath = "Desktop/escape"
         }
         let problems = VaultStore.verify(snapshot: bad)
@@ -1075,7 +1075,7 @@ private struct TestMoveError: Error, Equatable { let tag: String }
     }
 }
 
-// MARK: - 子进程大量 stderr 输出不得死锁（回归：ditto 警告灌满管道缓冲）
+// MARK: - 子进程大量 stderr 输出不得死锁（回归：归档工具警告灌满管道缓冲）
 
 @Test(.timeLimit(.minutes(1)))
 func runProcessSurvivesHugeStderrOutput() {
@@ -1089,7 +1089,7 @@ func runProcessSurvivesHugeStderrOutput() {
     done
     echo OK
     """
-    let result = ZipArchiver.runProcess("/bin/sh", ["-c", script])
+    let result = Archiver.runProcess("/bin/sh", ["-c", script])
     #expect(result.status == 0)
     #expect(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "OK")
     #expect(result.stderr.contains("warning line 7999"))
@@ -1097,9 +1097,9 @@ func runProcessSurvivesHugeStderrOutput() {
 
 @Test func truncatedForDisplayLimitsLongText() {
     let short = "短消息"
-    #expect(ZipArchiver.truncatedForDisplay(short) == short)
+    #expect(Archiver.truncatedForDisplay(short) == short)
     let long = String(repeating: "警告行\n", count: 2000)
-    let out = ZipArchiver.truncatedForDisplay(long)
+    let out = Archiver.truncatedForDisplay(long)
     #expect(out.count < 1400)
     #expect(out.contains("已截断"))
 }
@@ -1210,7 +1210,7 @@ func runProcessSurvivesHugeStderrOutput() {
         let main = try #require(manifest.entries.first { $0.id == "container-com.tencent.xinWeChat" })
         // 归档与清单都不含受保护 plist（fixture 主容器只有 2 个数据文件）
         #expect(main.fileCount == 2)
-        let entries = try ZipArchiver.listEntries(
+        let entries = try Archiver.listEntries(
             archive: snapshot.directoryURL.appendingPathComponent(main.archiveName))
         #expect(!entries.contains { $0.contains("containermanagerd") })
         // 源目录里的 plist 原样保留

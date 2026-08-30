@@ -1,38 +1,46 @@
 import Foundation
 
-/// ZIP 归档：封装系统 ditto。
-/// 选 ditto ZIP 的原因：把 macOS 扩展属性与资源叉打进 ZIP（--sequesterRsrc，
-/// AppleDouble/__MACOSX 机制），单文件归档可安全落在 exFAT 等不支持
-/// 这些元数据的文件系统上；解包时 ditto 自动还原。
-enum ZipArchiver {
-    static let dittoPath = "/usr/bin/ditto"
-    static let zipinfoPath = "/usr/bin/zipinfo"
+/// 归档：系统 bsdtar（libarchive）tar + --mac-metadata。
+/// tar 用 AppleDouble 机制把 macOS 扩展属性与资源叉封进单文件归档，
+/// 可安全落在 exFAT 等不支持这些元数据的文件系统上，解包自动还原。
+///
+/// 为什么不用 ditto ZIP：ditto 对超过 4GB 的归档写不出标准 ZIP64，
+/// 除 Apple 自家工具外一律判为损坏（实测 45GB 归档 zipinfo/bsdtar 均拒读），
+/// 而微信主容器动辄数十 GB。微信数据多为已压缩媒体，tar 免压缩打包
+/// 还能直接跑满磁盘速度（实测比 ditto ZIP 快约 8 倍）。
+enum Archiver {
+    static let tarPath = "/usr/bin/tar"
 
-    /// 打包目录为 ZIP（--keepParent：包内保留最外层目录名）。
-    static func createZip(source: URL, archive: URL) throws {
-        let result = runProcess(dittoPath, [
-            "-c", "-k", "--sequesterRsrc", "--keepParent", source.path, archive.path,
+    /// 打包目录为 tar（-C 父目录 + 末级名：包内保留最外层目录名）。
+    static func createArchive(source: URL, archive: URL) throws {
+        let result = runProcess(tarPath, [
+            "-cf", archive.path, "--mac-metadata",
+            "-C", source.deletingLastPathComponent().path, source.lastPathComponent,
         ])
         guard result.status == 0 else {
             throw BackupError.archiveFailed(
-                "ditto 打包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
+                "tar 打包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
         }
     }
 
-    /// 解包 ZIP 到目录（ditto 会还原扩展属性与资源叉）。
-    static func extractZip(archive: URL, to directory: URL) throws {
-        let result = runProcess(dittoPath, ["-x", "-k", archive.path, directory.path])
+    /// 解包 tar 到目录（--mac-metadata 还原扩展属性与资源叉；
+    /// libarchive 默认拒绝绝对路径与 .. 穿越条目，双保险）。
+    static func extractArchive(archive: URL, to directory: URL) throws {
+        let result = runProcess(tarPath, [
+            "-xpf", archive.path, "--mac-metadata", "-C", directory.path,
+        ])
         guard result.status == 0 else {
             throw BackupError.archiveFailed(
-                "ditto 解包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
+                "tar 解包退出码 \(result.status)：\(truncatedForDisplay(result.stderr))")
         }
     }
 
-    /// 列出 ZIP 内全部条目路径（zipinfo -1）。
+    /// 列出归档内全部条目路径（tar -tf）。
     static func listEntries(archive: URL) throws -> [String] {
-        let result = runProcess(zipinfoPath, ["-1", archive.path])
+        let result = runProcess(tarPath, ["-tf", archive.path])
         guard result.status == 0 else {
-            throw BackupError.archiveFailed("zipinfo 退出码 \(result.status)：\(result.stderr)")
+            throw BackupError.archiveFailed(
+                "列出归档条目失败（tar 退出码 \(result.status)）：\(truncatedForDisplay(result.stderr))")
         }
         return result.stdout.split(separator: "\n").map(String.init)
     }

@@ -1,7 +1,7 @@
 import Foundation
 
 /// 备份仓库：<所选目录>/WeChatBackups/<快照目录>/。
-/// 快照目录内：<组件id>.zip × N + manifest.json + COMPLETE。
+/// 快照目录内：<组件id>.tar × N + manifest.json + COMPLETE。
 /// 目录与文件名全部为 exFAT 安全的 ASCII。
 enum VaultStore {
     static let vaultDirName = "WeChatBackups"
@@ -118,9 +118,9 @@ enum VaultStore {
                 problems.append("无法读取归档：\(entry.archiveName)")
             }
             // 条目须安全且都在预期顶层目录（源目录末级名）内。
-            if let entries = try? ZipArchiver.listEntries(archive: archive) {
+            if let entries = try? Archiver.listEntries(archive: archive) {
                 do {
-                    try ZipArchiver.validateEntries(
+                    try Archiver.validateEntries(
                         entries,
                         expectedTopLevel: (entry.relativePath as NSString).lastPathComponent)
                 } catch {

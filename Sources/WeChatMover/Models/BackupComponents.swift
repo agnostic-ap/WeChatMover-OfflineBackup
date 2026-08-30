@@ -177,8 +177,8 @@ enum ManifestValidation {
         if name == "." || name == ".." || name.hasPrefix(".") {
             return "archiveName 非法或为隐藏文件：\(name)"
         }
-        if !name.hasSuffix(".zip") || name.count <= 4 {
-            return "archiveName 不是 .zip 文件：\(name)"
+        if !name.hasSuffix(".tar") || name.count <= 4 {
+            return "archiveName 不是 .tar 文件：\(name)"
         }
         return nil
     }
