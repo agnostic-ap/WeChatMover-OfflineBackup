@@ -171,7 +171,9 @@ final class AppViewModel: ObservableObject {
             let prog = self.backgroundProgress()
             let result: Result<SnapshotInfo, Error> = await Task.detached(priority: .userInitiated) {
                 do {
-                    return .success(try BackupEngine.performBackup(request, log: log, progress: prog))
+                    return .success(try BackupEngine.performBackup(
+                        request, log: log, progress: prog,
+                        isWeChatRunning: { WeChatDetector.isRunning() }))
                 } catch {
                     return .failure(error)
                 }
@@ -250,7 +252,9 @@ final class AppViewModel: ObservableObject {
             let result: Result<RestoreResult, Error> = await Task.detached(priority: .userInitiated) {
                 do {
                     return .success(try RestoreEngine.performRestore(
-                        plan: plan, environment: .live, log: log, progress: prog))
+                        plan: plan, environment: .live,
+                        isWeChatRunning: { WeChatDetector.isRunning() },
+                        log: log, progress: prog))
                 } catch {
                     return .failure(error)
                 }

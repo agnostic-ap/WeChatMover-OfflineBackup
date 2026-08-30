@@ -60,6 +60,32 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         spaceMargin: 0)
 }
 
+/// 测试专用引擎入口：微信运行检测一律注入假闭包（默认「未运行」），
+/// 保证测试绝不查询/触碰真实微信。需要覆盖竞态分支时显式传入闭包。
+private func runBackup(
+    _ request: BackupRequest,
+    log: (String) -> Void = { _ in },
+    progress: (Double) -> Void = { _ in },
+    isCancelled: () -> Bool = { false },
+    isWeChatRunning: () -> Bool = { false }
+) throws -> SnapshotInfo {
+    try BackupEngine.performBackup(
+        request, log: log, progress: progress,
+        isCancelled: isCancelled, isWeChatRunning: isWeChatRunning)
+}
+
+private func runRestore(
+    plan: RestorePlan,
+    environment: WeChatEnvironment,
+    now: Date = Date(),
+    fileOps: RestoreEngine.FileOps = RestoreEngine.FileOps(),
+    isWeChatRunning: () -> Bool = { false }
+) throws -> RestoreResult {
+    try RestoreEngine.performRestore(
+        plan: plan, environment: environment, now: now,
+        fileOps: fileOps, isWeChatRunning: isWeChatRunning)
+}
+
 // MARK: - 微信家族名与组件发现
 
 @Test func weChatFamilyNameMatching() {
@@ -303,7 +329,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         try FileManager.default.createDirectory(
             at: env.home, withIntermediateDirectories: true)
         let request = makeBackupRequest(env: env, vault: vault)
-        let snapshot = try BackupEngine.performBackup(request)
+        let snapshot = try runBackup(request)
         #expect(snapshot.isComplete)
 
         // 篡改 manifest → 完成标记失配 → 不完整
@@ -325,8 +351,8 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         let env = try makeFixtureHome(vault.appendingPathComponent("home"))
         let t1 = Date(timeIntervalSinceNow: -7200)
         let t2 = Date(timeIntervalSinceNow: -3600)
-        _ = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault, now: t1))
-        _ = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault, now: t2))
+        _ = try runBackup(makeBackupRequest(env: env, vault: vault, now: t1))
+        _ = try runBackup(makeBackupRequest(env: env, vault: vault, now: t2))
         // 手造一个中断残留（.inprogress）
         try FileManager.default.createDirectory(
             at: VaultStore.vaultRoot(base: vault)
@@ -344,7 +370,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
 @Test func verifyPassesAndCatchesCorruption() throws {
     try withTempDir { vault in
         let env = try makeFixtureHome(vault.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
         #expect(VaultStore.verify(snapshot: snapshot).isEmpty)
 
         // 破坏一个归档 → 验证报大小与 SHA-256 问题
@@ -374,7 +400,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
 @Test func deleteSnapshotRemovesRealSnapshot() throws {
     try withTempDir { vault in
         let env = try makeFixtureHome(vault.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
         try VaultStore.deleteSnapshot(snapshot, base: vault)
         #expect(VaultStore.listSnapshots(base: vault).isEmpty)
     }
@@ -388,7 +414,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
         var logs: [String] = []
         var progressValues: [Double] = []
-        let snapshot = try BackupEngine.performBackup(
+        let snapshot = try runBackup(
             makeBackupRequest(env: env, vault: vault),
             log: { logs.append($0) },
             progress: { progressValues.append($0) })
@@ -425,7 +451,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
     try withTempDir { root in
         let env = WeChatEnvironment(home: root.appendingPathComponent("home"))
         #expect(throws: BackupError.nothingToBackup) {
-            _ = try BackupEngine.performBackup(
+            _ = try runBackup(
                 makeBackupRequest(env: env, vault: root, components: []))
         }
     }
@@ -437,7 +463,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
         var calls = 0
         #expect(throws: BackupError.cancelled) {
-            _ = try BackupEngine.performBackup(
+            _ = try runBackup(
                 makeBackupRequest(env: env, vault: vault),
                 isCancelled: { calls += 1; return calls > 2 })   // 第三个组件前取消
         }
@@ -455,7 +481,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
     try withTempDir { root in
         let vault = root.appendingPathComponent("vault")
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
         try FileManager.default.removeItem(
             at: snapshot.directoryURL.appendingPathComponent("COMPLETE"))
         let incomplete = VaultStore.loadSnapshot(at: snapshot.directoryURL)
@@ -470,7 +496,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
     try withTempDir { root in
         let vault = root.appendingPathComponent("vault")
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
 
         let same = try RestoreEngine.makePlan(
             snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
@@ -499,7 +525,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         let originalFile = mainDir.appendingPathComponent("Data/Documents/file0.bin")
         let originalData = try Data(contentsOf: originalFile)
 
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
 
         // 备份后数据被「破坏」：改写内容 + 加新文件
         try Data("已损坏".utf8).write(to: originalFile)
@@ -507,7 +533,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
 
         let plan = try RestoreEngine.makePlan(
             snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
-        let result = try RestoreEngine.performRestore(
+        let result = try runRestore(
             plan: plan, environment: env,
             now: Date(timeIntervalSince1970: 1_772_400_000))
 
@@ -539,7 +565,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
     try withTempDir { root in
         let vault = root.appendingPathComponent("vault")
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
 
         // 模拟换机/清空：删除主容器
         let mainDir = env.home.appendingPathComponent(
@@ -552,7 +578,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
             $0.entry.id == "container-com.tencent.xinWeChat"
         }?.targetExists == false)
 
-        let result = try RestoreEngine.performRestore(plan: plan, environment: env)
+        let result = try runRestore(plan: plan, environment: env)
         #expect(FileManager.default.fileExists(
             atPath: mainDir.appendingPathComponent("Data/Documents/file0.bin").path))
         // 只有原本存在的 5 个目录留回滚副本
@@ -564,7 +590,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
     try withTempDir { root in
         let vault = root.appendingPathComponent("vault")
         let env = try makeFixtureHome(root.appendingPathComponent("home"))
-        let snapshot = try BackupEngine.performBackup(makeBackupRequest(env: env, vault: vault))
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
         let plan = try RestoreEngine.makePlan(
             snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
 
@@ -579,7 +605,7 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
             "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
         let before = FileStats.measure(at: mainDir)
         #expect(throws: BackupError.self) {
-            _ = try RestoreEngine.performRestore(plan: plan, environment: env)
+            _ = try runRestore(plan: plan, environment: env)
         }
         // 数据分毫未动，也没有回滚/暂存残留
         #expect(FileStats.measure(at: mainDir) == before)
@@ -630,4 +656,357 @@ private func makeBackupRequest(env: WeChatEnvironment, vault: URL,
         isRunning: { true },
         graceful: { }, force: { })
     #expect(!ok)
+}
+
+// MARK: - 备份仓库与源目录重叠（防递归归档/写入源目录）
+
+/// 改写快照清单并重写完成标记（模拟恶意/损坏 manifest 的测试辅助）。
+private func rewriteManifest(
+    _ snapshot: SnapshotInfo,
+    mutate: (inout BackupManifest) -> Void
+) throws -> SnapshotInfo {
+    var manifest = try #require(snapshot.manifest)
+    mutate(&manifest)
+    try VaultStore.writeManifest(manifest, to: snapshot.directoryURL)
+    try VaultStore.writeCompletionMarker(in: snapshot.directoryURL)
+    return VaultStore.loadSnapshot(at: snapshot.directoryURL)
+}
+
+@Test func backupRefusesVaultInsideSourceComponent() throws {
+    try withTempDir { root in
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        // 备份仓库选在主容器内部 → 归档时会把仓库归进去（递归），必须拒绝
+        let vault = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat/Backups", isDirectory: true)
+        #expect(throws: BackupError.self) {
+            _ = try runBackup(makeBackupRequest(env: env, vault: vault))
+        }
+        // 未在源目录里留下任何写入
+        #expect(!FileManager.default.fileExists(atPath: vault.path))
+    }
+}
+
+@Test func backupRefusesSourceInsideVault() throws {
+    try withTempDir { root in
+        // home 摆在仓库根内部 → 源目录会被写进的仓库包含，必须拒绝
+        let vault = root
+        let env = try makeFixtureHome(
+            VaultStore.vaultRoot(base: vault).appendingPathComponent("home"))
+        #expect(throws: BackupError.self) {
+            _ = try runBackup(makeBackupRequest(env: env, vault: vault))
+        }
+    }
+}
+
+@Test func backupOverlapCheckResolvesSymlinks() throws {
+    try withTempDir { root in
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        // base 下预置符号链接 WeChatBackups → 主容器：解析后仓库根 == 源目录
+        let base = root.appendingPathComponent("base", isDirectory: true)
+        try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: base.appendingPathComponent("WeChatBackups"),
+            withDestinationURL: env.home.appendingPathComponent(
+                "Library/Containers/com.tencent.xinWeChat"))
+        #expect(throws: BackupError.self) {
+            _ = try runBackup(makeBackupRequest(env: env, vault: base))
+        }
+        // 源目录未被写入快照内容
+        let srcEntries = try FileManager.default.contentsOfDirectory(
+            atPath: env.home.appendingPathComponent(
+                "Library/Containers/com.tencent.xinWeChat").path)
+        #expect(!srcEntries.contains { $0.hasPrefix("WeChatBackup-") })
+    }
+}
+
+@Test func pathsOverlapLogic() {
+    let a = URL(fileURLWithPath: "/tmp/a", isDirectory: true)
+    #expect(BackupEngine.pathsOverlap(a, a))
+    #expect(BackupEngine.pathsOverlap(a, URL(fileURLWithPath: "/tmp/a/b")))
+    #expect(BackupEngine.pathsOverlap(URL(fileURLWithPath: "/tmp/a/b"), a))
+    #expect(!BackupEngine.pathsOverlap(a, URL(fileURLWithPath: "/tmp/ab")))   // 前缀但非父子
+    #expect(!BackupEngine.pathsOverlap(a, URL(fileURLWithPath: "/tmp/c")))
+}
+
+// MARK: - 清单白名单校验（恶意 manifest）
+
+@Test func manifestArchiveNameValidation() {
+    #expect(ManifestValidation.archiveNameProblem("container-x.zip") == nil)
+    #expect(ManifestValidation.archiveNameProblem("../evil.zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem("sub/evil.zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem("a\\b.zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem(".hidden.zip") != nil)
+    #expect(ManifestValidation.archiveNameProblem("..") != nil)
+    #expect(ManifestValidation.archiveNameProblem("") != nil)
+    #expect(ManifestValidation.archiveNameProblem("noext") != nil)
+    #expect(ManifestValidation.archiveNameProblem(".zip") != nil)
+}
+
+@Test func manifestRelativePathValidation() {
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Containers/com.tencent.xinWeChat", kind: .container) == nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Group Containers/5A4RE8SF68.com.tencent.xinWeChat", kind: .groupContainer) == nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Application Scripts/com.tencent.xinWeChat.WeChatMacShare", kind: .appScripts) == nil)
+    // 越界/穿越/非白名单
+    #expect(ManifestValidation.relativePathProblem(
+        "Desktop/com.tencent.xinWeChat", kind: .container) != nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "/Library/Containers/com.tencent.xinWeChat", kind: .container) != nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Containers/../../Desktop/com.tencent.xinWeChat", kind: .container) != nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Containers/com.apple.Notes", kind: .container) != nil)
+    // 父目录与 kind 不符
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Containers/com.tencent.xinWeChat", kind: .groupContainer) != nil)
+    // 不允许恢复进 .wcm- 派生目录名
+    #expect(ManifestValidation.relativePathProblem(
+        "Library/Containers/com.tencent.xinWeChat.wcm-rollback-20260830-1", kind: .container) != nil)
+    // 应用本体：仅需不可穿越
+    #expect(ManifestValidation.relativePathProblem(
+        "Applications/WeChat.app", kind: .application) == nil)
+    #expect(ManifestValidation.relativePathProblem(
+        "../Applications/WeChat.app", kind: .application) != nil)
+}
+
+@Test func makePlanRejectsMaliciousManifests() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let good = try runBackup(makeBackupRequest(env: env, vault: vault))
+
+        func expectPlanRejected(_ mutate: (inout BackupManifest) -> Void) throws {
+            let bad = try rewriteManifest(good, mutate: mutate)
+            #expect(throws: BackupError.self) {
+                _ = try RestoreEngine.makePlan(
+                    snapshot: bad, environment: env, currentWeChatVersion: "4.0.6")
+            }
+        }
+
+        // archiveName 穿越 / 带子路径
+        try expectPlanRejected { $0.entries[0].archiveName = "../../evil.zip" }
+        try expectPlanRejected { $0.entries[0].archiveName = "sub/evil.zip" }
+        // relativePath 指向白名单之外
+        try expectPlanRejected { $0.entries[0].relativePath = "Desktop/com.tencent.xinWeChat" }
+        try expectPlanRejected {
+            $0.entries[0].relativePath = "Library/Containers/../../Desktop/com.tencent.xinWeChat"
+        }
+        try expectPlanRejected { $0.entries[0].relativePath = "Library/Containers/com.apple.Notes" }
+        try expectPlanRejected {
+            $0.entries[0].relativePath = "Library/Containers/com.tencent.xinWeChat.wcm-rollback-1"
+        }
+        // 重复 target / 重复 archiveName
+        try expectPlanRejected { $0.entries[1].relativePath = $0.entries[0].relativePath }
+        try expectPlanRejected { $0.entries[1].archiveName = $0.entries[0].archiveName }
+        // 没有可自动恢复的条目
+        try expectPlanRejected { m in
+            m.entries = [BackupManifest.Entry(
+                id: "app-WeChat", kind: .application,
+                displayName: "微信应用本体（WeChat.app）",
+                relativePath: "Applications/WeChat.app",
+                archiveName: "app-WeChat.zip",
+                fileCount: 1, logicalSize: 1, archiveSize: 1, sha256: "00")]
+        }
+
+        // 还原为合法清单后计划照常可用（fixture 未被上面破坏）
+        let restored = try rewriteManifest(good) { _ in }
+        _ = try RestoreEngine.makePlan(
+            snapshot: restored, environment: env, currentWeChatVersion: "4.0.6")
+    }
+}
+
+// MARK: - verify 的结构与清单校验
+
+@Test func verifyReportsManifestProblems() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let good = try runBackup(makeBackupRequest(env: env, vault: vault))
+
+        let bad = try rewriteManifest(good) {
+            $0.entries[0].archiveName = "../evil.zip"
+            $0.entries[1].relativePath = "Desktop/escape"
+        }
+        let problems = VaultStore.verify(snapshot: bad)
+        #expect(problems.contains { $0.contains("archiveName") })
+        #expect(problems.contains { $0.contains("relativePath") || $0.contains("白名单") })
+    }
+}
+
+@Test func verifyReportsUnexpectedTopLevelStructure() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let good = try runBackup(makeBackupRequest(env: env, vault: vault))
+
+        // 把 MacShare 条目的 relativePath 改成另一个合法家族名：
+        // 清单本身合法，但归档顶层目录与预期不符 → 结构校验必须报告
+        let entryIndex = try #require(good.manifest?.entries.firstIndex {
+            $0.id == "container-com.tencent.xinWeChat.WeChatMacShare"
+        })
+        let bad = try rewriteManifest(good) {
+            $0.entries[entryIndex].relativePath = "Library/Containers/com.tencent.xinWeChat.Other"
+        }
+        let problems = VaultStore.verify(snapshot: bad)
+        #expect(problems.contains { $0.contains("结构校验未通过") })
+        // 未被篡改的快照依旧全部通过
+        let clean = try rewriteManifest(good) { _ in }
+        #expect(VaultStore.verify(snapshot: clean).isEmpty)
+    }
+}
+
+// MARK: - 回滚失败不吞错（可注入文件操作）
+
+private struct TestMoveError: Error, Equatable { let tag: String }
+
+@Test func restoreCommitFailureRollsBackAndRethrowsOriginal() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let mainDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
+        let marker = mainDir.appendingPathComponent("Data/Documents/file0.bin")
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
+        try Data("备份后的新数据".utf8).write(to: marker)
+
+        let plan = try RestoreEngine.makePlan(
+            snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
+        let groupTarget = "5A4RE8SF68.com.tencent.xinWeChat"
+        // 第 4 项（群组容器）落位时注入失败；其余移动放行
+        let ops = RestoreEngine.FileOps(moveItem: { from, to in
+            if from.path.contains(".wcm-staging-") && to.lastPathComponent == groupTarget {
+                throw TestMoveError(tag: "commit-fail")
+            }
+            try FileManager.default.moveItem(at: from, to: to)
+        })
+        var thrown: Error?
+        do {
+            _ = try runRestore(
+                plan: plan, environment: env, fileOps: ops, isWeChatRunning: { false })
+        } catch { thrown = error }
+
+        // 抛出的是原始错误（回滚成功时不得包装成回滚错误，也不得吞掉）
+        #expect(thrown as? TestMoveError == TestMoveError(tag: "commit-fail"))
+        // 已回滚：恢复前的数据回到原位（含备份后的修改）
+        #expect(try Data(contentsOf: marker) == Data("备份后的新数据".utf8))
+        // 不留 rollback/staging；失败落位的副本以 .wcm-failed 保留（未删除）
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: mainDir.deletingLastPathComponent().path)
+        #expect(!siblings.contains { $0.contains(".wcm-rollback-") })
+        #expect(!siblings.contains { $0.contains(".wcm-staging-") })
+        #expect(siblings.contains { $0.contains(".wcm-failed-") })
+    }
+}
+
+@Test func restoreRollbackFailureThrowsSevereErrorAndKeepsData() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let mainDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
+        let marker = mainDir.appendingPathComponent("Data/Documents/file0.bin")
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
+        try Data("恢复前的现网数据".utf8).write(to: marker)
+
+        let plan = try RestoreEngine.makePlan(
+            snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
+        let now = Date(timeIntervalSince1970: 1_772_500_000)
+        let ts = VaultStore.timestampString(now)
+        let groupTarget = "5A4RE8SF68.com.tencent.xinWeChat"
+        let mainFailedName = "com.tencent.xinWeChat.wcm-failed-\(ts)"
+        // 群组容器落位失败触发回滚；回滚中主容器「移开新数据」也失败 → 回滚不完整
+        let ops = RestoreEngine.FileOps(moveItem: { from, to in
+            if from.path.contains(".wcm-staging-") && to.lastPathComponent == groupTarget {
+                throw TestMoveError(tag: "commit-fail")
+            }
+            if to.lastPathComponent == mainFailedName {
+                throw TestMoveError(tag: "rollback-fail")
+            }
+            try FileManager.default.moveItem(at: from, to: to)
+        })
+        var thrown: Error?
+        do {
+            _ = try runRestore(
+                plan: plan, environment: env, now: now,
+                fileOps: ops, isWeChatRunning: { false })
+        } catch { thrown = error }
+
+        // 必须是明确的严重错误，且消息列出原数据（rollback）位置
+        guard case .rollbackIncomplete(let msg)? = thrown as? BackupError else {
+            Issue.record("期望 rollbackIncomplete，实得 \(String(describing: thrown))")
+            return
+        }
+        let rollbackName = "com.tencent.xinWeChat.wcm-rollback-\(ts)"
+        #expect(msg.contains(rollbackName))
+        #expect(msg.contains("commit-fail") || msg.contains("首因"))
+        // 原数据完好保留在 rollback 目录，未被删除
+        let rollbackFile = mainDir.deletingLastPathComponent()
+            .appendingPathComponent(rollbackName)
+            .appendingPathComponent("Data/Documents/file0.bin")
+        #expect(try Data(contentsOf: rollbackFile) == Data("恢复前的现网数据".utf8))
+        // 快照内容也已落到主容器原位（新数据未被移走），同样未删除
+        #expect(FileManager.default.fileExists(atPath: marker.path))
+    }
+}
+
+// MARK: - 写操作前复查微信未运行（防退出后重开竞态；全部注入闭包）
+
+@Test func backupRefusesWhenWeChatRunningBeforeFirstWrite() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        #expect(throws: BackupError.wechatStillRunning) {
+            _ = try runBackup(
+                makeBackupRequest(env: env, vault: vault),
+                isWeChatRunning: { true })
+        }
+        // 仓库里没有任何写入残留
+        #expect(!FileManager.default.fileExists(atPath: VaultStore.vaultRoot(base: vault).path))
+    }
+}
+
+@Test func backupAbortsWhenWeChatRelaunchesMidway() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        var calls = 0
+        #expect(throws: BackupError.wechatStillRunning) {
+            _ = try runBackup(
+                makeBackupRequest(env: env, vault: vault),
+                isWeChatRunning: { calls += 1; return calls > 2 })   // 第二个组件前重开
+        }
+        // 中止后不留 .inprogress 残留
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            atPath: VaultStore.vaultRoot(base: vault).path)) ?? []
+        #expect(entries.isEmpty)
+    }
+}
+
+@Test func restoreAbortsBeforeCommitWhenWeChatRelaunches() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let mainDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
+        let plan = try RestoreEngine.makePlan(
+            snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
+        let before = FileStats.measure(at: mainDir)
+
+        var calls = 0
+        #expect(throws: BackupError.wechatStillRunning) {
+            // 第 1 次检查（解压前）通过，第 2 次（落位前）发现微信重开 → 中止
+            _ = try runRestore(
+                plan: plan, environment: env,
+                isWeChatRunning: { calls += 1; return calls >= 2 })
+        }
+        #expect(calls >= 2)
+        // 微信目录分毫未动，暂存已清理
+        #expect(FileStats.measure(at: mainDir) == before)
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: mainDir.deletingLastPathComponent().path)
+        #expect(!siblings.contains { $0.contains(".wcm-") })
+    }
 }

@@ -96,6 +96,8 @@ enum VaultStore {
         if manifest.formatVersion > BackupManifest.currentFormatVersion {
             problems.append("清单格式版本 \(manifest.formatVersion) 高于本工具支持的版本")
         }
+        // 清单自身的白名单问题（archiveName / relativePath / 重复 / 空自动恢复项）。
+        problems += ManifestValidation.problems(in: manifest)
         let fm = FileManager.default
         for entry in manifest.entries {
             let archive = snapshot.directoryURL.appendingPathComponent(entry.archiveName)
@@ -115,11 +117,19 @@ enum VaultStore {
             } else {
                 problems.append("无法读取归档：\(entry.archiveName)")
             }
+            // 条目须安全且都在预期顶层目录（源目录末级名）内。
             if let entries = try? ZipArchiver.listEntries(archive: archive) {
-                let unsafe = ZipArchiver.unsafeEntries(entries)
-                if !unsafe.isEmpty {
-                    problems.append("归档含不安全路径：\(entry.archiveName)")
+                do {
+                    try ZipArchiver.validateEntries(
+                        entries,
+                        expectedTopLevel: (entry.relativePath as NSString).lastPathComponent)
+                } catch {
+                    let msg = (error as? LocalizedError)?.errorDescription
+                        ?? String(describing: error)
+                    problems.append("归档结构校验未通过 \(entry.archiveName)：\(msg)")
                 }
+            } else {
+                problems.append("无法列出归档条目：\(entry.archiveName)")
             }
         }
         return problems

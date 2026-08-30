@@ -151,12 +151,92 @@ enum PathGuard {
         try FileManager.default.removeItem(at: url)
     }
 
-    /// 校验后执行移动（源/目标都必须在白名单内）；不符则拒绝。
-    static func move(_ from: URL, to: URL, home: URL) throws {
+    /// 仅校验移动是否被白名单允许（源/目标都必须在白名单内），不做任何 IO。
+    static func validateMove(_ from: URL, to: URL, home: URL) throws {
         guard isProtectedWeChatPath(from, home: home), isProtectedWeChatPath(to, home: home) else {
             throw BackupError.pathNotWhitelisted("\(from.path) → \(to.path)")
         }
+    }
+
+    /// 校验后执行移动；不符白名单则拒绝。
+    static func move(_ from: URL, to: URL, home: URL) throws {
+        try validateMove(from, to: to, home: home)
         try FileManager.default.moveItem(at: from, to: to)
+    }
+}
+
+/// 清单条目合法性校验（纯函数，可单测）：
+/// 恶意/损坏的 manifest 不得把恢复引导到白名单之外。
+enum ManifestValidation {
+    /// archiveName 必须是快照目录的安全直接文件名。返回问题描述（nil = 合法）。
+    static func archiveNameProblem(_ name: String) -> String? {
+        if name.isEmpty { return "archiveName 为空" }
+        if name.contains("/") || name.contains("\\") || name.contains(":") {
+            return "archiveName 含路径分隔符：\(name)"
+        }
+        if name == "." || name == ".." || name.hasPrefix(".") {
+            return "archiveName 非法或为隐藏文件：\(name)"
+        }
+        if !name.hasSuffix(".zip") || name.count <= 4 {
+            return "archiveName 不是 .zip 文件：\(name)"
+        }
+        return nil
+    }
+
+    /// 可自动恢复条目的 relativePath 必须精确映射到微信组件白名单：
+    /// 恰为「三个允许父目录之一 / 微信家族名」两级结构，无 ".."、不以 "/" 开头，
+    /// 且名称不含 .wcm- 派生后缀（不允许恢复进回滚/暂存目录名）。
+    static func relativePathProblem(_ relativePath: String, kind: BackupComponent.Kind) -> String? {
+        if kind == .application {
+            // 应用本体不参与自动恢复，只需不可穿越。
+            if relativePath.hasPrefix("/") || relativePath.split(separator: "/").contains("..") {
+                return "应用归档 relativePath 非法：\(relativePath)"
+            }
+            return nil
+        }
+        if relativePath.hasPrefix("/") { return "relativePath 是绝对路径：\(relativePath)" }
+        let expectedParent: String
+        switch kind {
+        case .container: expectedParent = WeChatEnvironment.containersDir
+        case .groupContainer: expectedParent = WeChatEnvironment.groupContainersDir
+        case .appScripts: expectedParent = WeChatEnvironment.appScriptsDir
+        case .application: expectedParent = ""   // 上面已 return
+        }
+        let name = (relativePath as NSString).lastPathComponent
+        guard relativePath == expectedParent + "/" + name else {
+            return "relativePath 不在组件白名单目录内：\(relativePath)"
+        }
+        guard WeChatEnvironment.isWeChatFamilyName(name) else {
+            return "relativePath 末级不是微信家族名：\(relativePath)"
+        }
+        // 前缀规则会放过 .wcm- 派生名（回滚/暂存目录），恢复目标必须显式排除。
+        if name.contains(".wcm-") {
+            return "relativePath 指向本工具的派生目录名：\(relativePath)"
+        }
+        return nil
+    }
+
+    /// 汇总清单问题：逐条 archiveName/relativePath，外加
+    /// 重复 target、重复 archiveName、无可自动恢复条目。空数组 = 合法。
+    static func problems(in manifest: BackupManifest) -> [String] {
+        var problems: [String] = []
+        for entry in manifest.entries {
+            if let p = archiveNameProblem(entry.archiveName) { problems.append(p) }
+            if let p = relativePathProblem(entry.relativePath, kind: entry.kind) { problems.append(p) }
+        }
+        let restorable = manifest.restorableEntries
+        if restorable.isEmpty {
+            problems.append("清单没有可自动恢复的条目")
+        }
+        let targets = restorable.map(\.relativePath)
+        for dup in Set(targets.filter { t in targets.filter { $0 == t }.count > 1 }) {
+            problems.append("重复的恢复目标：\(dup)")
+        }
+        let archives = manifest.entries.map(\.archiveName)
+        for dup in Set(archives.filter { a in archives.filter { $0 == a }.count > 1 }) {
+            problems.append("重复的归档文件名：\(dup)")
+        }
+        return problems
     }
 }
 
@@ -175,6 +255,9 @@ enum BackupError: Error, LocalizedError, Equatable {
     case pathNotWhitelisted(String)
     case restoreFailed(String)
     case vaultPathInvalid(String)
+    case vaultOverlapsSource(String)
+    case manifestInvalid(String)
+    case rollbackIncomplete(String)
 
     var errorDescription: String? {
         switch self {
@@ -204,6 +287,12 @@ enum BackupError: Error, LocalizedError, Equatable {
             return "恢复失败：\(msg)"
         case .vaultPathInvalid(let path):
             return "备份仓库路径无效：\(path)"
+        case .vaultOverlapsSource(let msg):
+            return "备份位置与微信数据目录重叠，已拒绝（防止递归归档/写入源目录）：\(msg)"
+        case .manifestInvalid(let msg):
+            return "快照清单校验未通过，已拒绝恢复：\(msg)"
+        case .rollbackIncomplete(let msg):
+            return "严重：恢复失败且自动回滚未完全成功，任何数据都未被删除，请按以下路径手动处理。\(msg)"
         }
     }
 }

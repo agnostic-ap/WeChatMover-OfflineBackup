@@ -19,15 +19,39 @@ struct BackupRequest: Sendable {
 /// 同步实现，由调用方放到后台线程执行。
 enum BackupEngine {
 
+    /// path 是否等于 other、位于其内部或包含它（先解析符号链接与 ../）。
+    static func pathsOverlap(_ a: URL, _ b: URL) -> Bool {
+        let pa = a.standardizedFileURL.resolvingSymlinksInPath().path
+        let pb = b.standardizedFileURL.resolvingSymlinksInPath().path
+        return pa == pb || pa.hasPrefix(pb + "/") || pb.hasPrefix(pa + "/")
+    }
+
+    /// 备份仓库不得与任何源组件目录重叠（相同 / 在其内部 / 包含源目录），
+    /// 否则会递归归档或把源写进仓库。比较时解析符号链接。
+    static func checkVaultDoesNotOverlapSources(_ request: BackupRequest) throws {
+        let vaultRoot = VaultStore.vaultRoot(base: request.vaultBase)
+        for component in request.components {
+            let src = request.environment.url(for: component)
+            if pathsOverlap(vaultRoot, src) {
+                throw BackupError.vaultOverlapsSource(
+                    "\(vaultRoot.path) ↔ \(src.path)（\(component.displayName)）")
+            }
+        }
+    }
+
     /// 执行备份，返回完成的快照。
     /// 失败/取消时清理未完成的快照目录（仅限本次新建的 .inprogress 目录）。
+    /// isWeChatRunning 在第一次写盘前和每个组件归档前都会复查，
+    /// 防止「退出微信后又被立即重开」的竞态；测试注入假闭包，不触碰真实微信。
     static func performBackup(
         _ request: BackupRequest,
         log: (String) -> Void = { _ in },
         progress: (Double) -> Void = { _ in },
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        isWeChatRunning: () -> Bool = { WeChatDetector.isRunning() }
     ) throws -> SnapshotInfo {
         guard !request.components.isEmpty else { throw BackupError.nothingToBackup }
+        try checkVaultDoesNotOverlapSources(request)
         let fm = FileManager.default
 
         // 1. 统计源大小（逻辑字节 + 文件数），用于空间预检与进度。
@@ -55,6 +79,8 @@ enum BackupEngine {
         if fm.fileExists(atPath: finalDir.path) || fm.fileExists(atPath: workDir.path) {
             throw BackupError.archiveFailed("同名快照已存在：\(finalDir.lastPathComponent)")
         }
+        // 第一次写盘前复查微信确实没在运行（防退出后立即重开的竞态）。
+        guard !isWeChatRunning() else { throw BackupError.wechatStillRunning }
         try fm.createDirectory(at: workDir, withIntermediateDirectories: true)
 
         // 之后任何失败都清掉本次新建的工作目录（只删自己刚建的 .inprogress）。
@@ -68,6 +94,8 @@ enum BackupEngine {
         var doneLogical: Int64 = 0
         for component in request.components {
             if isCancelled() { try cleanupAndThrow(BackupError.cancelled) }
+            // 每个组件归档前复查：微信中途被打开会导致归档内容不一致。
+            if isWeChatRunning() { try cleanupAndThrow(BackupError.wechatStillRunning) }
             let src = request.environment.url(for: component)
             let archiveName = component.id + ".zip"
             let archiveURL = workDir.appendingPathComponent(archiveName)

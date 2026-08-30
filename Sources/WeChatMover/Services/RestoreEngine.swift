@@ -45,11 +45,23 @@ enum RestoreEngine {
         guard let manifest = snapshot.manifest, snapshot.isComplete else {
             throw BackupError.snapshotIncomplete(snapshot.name)
         }
+        // 清单本身先过白名单校验：archiveName 是安全文件名、relativePath 精确映射
+        // 微信组件、无重复 target/archiveName、有可自动恢复条目。
+        let manifestProblems = ManifestValidation.problems(in: manifest)
+        guard manifestProblems.isEmpty else {
+            throw BackupError.manifestInvalid(manifestProblems.joined(separator: "；"))
+        }
         let fm = FileManager.default
         var warnings: [String] = []
         var items: [RestorePlan.Item] = []
+        let snapshotDirPath = snapshot.directoryURL.standardizedFileURL.path
         for entry in manifest.restorableEntries {
             let archive = snapshot.directoryURL.appendingPathComponent(entry.archiveName)
+            // 双保险：拼接后归档必须仍是快照目录的直接子项。
+            guard archive.standardizedFileURL.deletingLastPathComponent().path == snapshotDirPath
+            else {
+                throw BackupError.manifestInvalid("归档越出快照目录：\(entry.archiveName)")
+            }
             if !fm.fileExists(atPath: archive.path) {
                 throw BackupError.archiveMissing(entry.archiveName)
             }
@@ -95,11 +107,22 @@ enum RestoreEngine {
 
     // MARK: - 执行恢复
 
+    /// 文件移动操作，可注入以便单测覆盖回滚失败分支（默认走 FileManager）。
+    struct FileOps {
+        var moveItem: (URL, URL) throws -> Void = {
+            try FileManager.default.moveItem(at: $0, to: $1)
+        }
+    }
+
+    /// isWeChatRunning 在解压暂存前与落位（唯一改动微信目录的阶段）前都会复查，
+    /// 防止「退出微信后又被立即重开」的竞态；测试注入假闭包，不触碰真实微信。
     static func performRestore(
         plan: RestorePlan,
         environment: WeChatEnvironment,
         now: Date = Date(),
         spaceMargin: Int64 = 256 << 20,
+        fileOps: FileOps = FileOps(),
+        isWeChatRunning: () -> Bool = { WeChatDetector.isRunning() },
         log: (String) -> Void = { _ in },
         progress: (Double) -> Void = { _ in }
     ) throws -> RestoreResult {
@@ -129,6 +152,8 @@ enum RestoreEngine {
         }
 
         // 3. 全部解压到目标同级的暂存目录（同卷，落位仅是改名）。
+        // 写暂存前复查微信未运行。
+        guard !isWeChatRunning() else { throw BackupError.wechatStillRunning }
         var stagedRoots: [URL] = []            // 暂存目录（可整体删除的唯一类型）
         func cleanupStaging() {
             for dir in stagedRoots { try? PathGuard.removeStaging(dir, home: home) }
@@ -162,22 +187,73 @@ enum RestoreEngine {
         }
 
         // 4. 落位（每项：原目录改名回滚副本 → 暂存移入原位）。失败自动回滚已完成项。
+        //    回滚自身的失败绝不吞掉：逐步收集详情、尽最大努力恢复，未能完全恢复时
+        //    抛出 rollbackIncomplete 并列出原数据与失败副本的位置；全程不删除任何数据。
+        func describe(_ error: Error) -> String {
+            (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        }
         var committed: [(item: RestorePlan.Item, rollback: URL?)] = []
-        func rollbackCommitted(_ error: Error) throws -> Never {
+        func rollbackCommitted(_ original: Error) throws -> Never {
             log("❌ 落位失败，开始自动回滚…")
+            var failures: [String] = []
+            var strandedRollbacks: [String] = []   // 未能移回原位的原数据（仍完好保留）
+            var failedDataDirs: [String] = []      // 已落位新数据被移去的 .wcm-failed 位置
             for (item, rollback) in committed.reversed() {
-                // 新落位的数据让开（改名保留，不删除），原数据改回原名。
-                let failedURL = item.targetURL.deletingLastPathComponent()
+                let target = item.targetURL
+                let failedURL = target.deletingLastPathComponent()
                     .appendingPathComponent(
-                        "\(item.targetURL.lastPathComponent).wcm-failed-\(ts)", isDirectory: true)
-                try? PathGuard.move(item.targetURL, to: failedURL, home: home)
+                        "\(target.lastPathComponent).wcm-failed-\(ts)", isDirectory: true)
+                // 先把已落位的新数据移开（改名保留，不删除）。
+                var targetCleared = !fm.fileExists(atPath: target.path)
+                if !targetCleared {
+                    do {
+                        try PathGuard.validateMove(target, to: failedURL, home: home)
+                        try fileOps.moveItem(target, failedURL)
+                        failedDataDirs.append(failedURL.path)
+                        targetCleared = true
+                    } catch {
+                        failures.append("无法移开新落位数据 \(target.path)：\(describe(error))")
+                    }
+                }
+                // 再把原数据移回原位。
                 if let rollback {
-                    try? PathGuard.move(rollback, to: item.targetURL, home: home)
+                    if targetCleared {
+                        do {
+                            try PathGuard.validateMove(rollback, to: target, home: home)
+                            try fileOps.moveItem(rollback, target)
+                        } catch {
+                            failures.append("无法把原数据移回 \(target.path)：\(describe(error))")
+                            strandedRollbacks.append(rollback.path)
+                        }
+                    } else {
+                        failures.append("原位被占用，原数据未移回：\(rollback.path)")
+                        strandedRollbacks.append(rollback.path)
+                    }
                 }
             }
             cleanupStaging()
-            log("已回滚到恢复前状态；如有 .wcm-failed-\(ts) 目录为失败残留，可手动检查后删除")
-            throw error
+            guard failures.isEmpty else {
+                var msg = "\n首因：\(describe(original))"
+                msg += "\n回滚失败详情：\n" + failures.map { "· " + $0 }.joined(separator: "\n")
+                if !strandedRollbacks.isEmpty {
+                    msg += "\n原数据完好保留在（请手动改回原名）：\n"
+                        + strandedRollbacks.map { "· " + $0 }.joined(separator: "\n")
+                }
+                if !failedDataDirs.isEmpty {
+                    msg += "\n失败落位的副本在（确认后可删除）：\n"
+                        + failedDataDirs.map { "· " + $0 }.joined(separator: "\n")
+                }
+                log("❌ 自动回滚未完全成功，任何数据都未被删除")
+                throw BackupError.rollbackIncomplete(msg)
+            }
+            log("已回滚到恢复前状态；如有 .wcm-failed-\(ts) 目录为失败落位的副本，可手动检查后删除")
+            throw original
+        }
+
+        // 落位（唯一改动微信目录的阶段）前最后复查微信未运行。
+        if isWeChatRunning() {
+            cleanupStaging()
+            throw BackupError.wechatStillRunning
         }
         var rollbackDirs: [String] = []
         for (item, stagedURL, _) in staged {
@@ -187,7 +263,8 @@ enum RestoreEngine {
                 let rollbackURL = item.targetURL.deletingLastPathComponent()
                     .appendingPathComponent("\(name).wcm-rollback-\(ts)", isDirectory: true)
                 do {
-                    try PathGuard.move(item.targetURL, to: rollbackURL, home: home)
+                    try PathGuard.validateMove(item.targetURL, to: rollbackURL, home: home)
+                    try fileOps.moveItem(item.targetURL, rollbackURL)
                 } catch {
                     try rollbackCommitted(error)
                 }
@@ -200,7 +277,7 @@ enum RestoreEngine {
                 guard PathGuard.isProtectedWeChatPath(item.targetURL, home: home) else {
                     throw BackupError.pathNotWhitelisted(item.targetURL.path)
                 }
-                try fm.moveItem(at: stagedURL, to: item.targetURL)
+                try fileOps.moveItem(stagedURL, item.targetURL)
             } catch {
                 committed.append((item, rollback))
                 try rollbackCommitted(error)
