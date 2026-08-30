@@ -39,7 +39,12 @@ enum ContainerCloner {
     }
 
     /// 整树克隆 source → destination（destination 不得已存在）。
-    /// EINTR 自动重试（整树克隆是原子的，重试代价为零）。
+    ///
+    /// 不能对容器根做一次 clonefile：根层的受保护 plist 会被一并克隆，
+    /// 而 App 的权限上下文读不了它（终端读得了），整个克隆会连带失败。
+    /// 因此：自建目标根目录（复制权限位），再逐顶层子项 clonefile——
+    /// 受保护文件在克隆阶段即被跳过；瞬时错误（EINTR，以及审查高载下
+    /// 偶发的拒绝）按子项重试。
     static func cloneTree(
         source: URL,
         to destination: URL,
@@ -47,16 +52,51 @@ enum ContainerCloner {
         cloneOp: (URL, URL) throws -> Void = systemCloneFile,
         log: (String) -> Void = { _ in }
     ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        if let attrs = try? fm.attributesOfItem(atPath: source.path),
+           let perms = attrs[.posixPermissions] {
+            try? fm.setAttributes([.posixPermissions: perms], ofItemAtPath: destination.path)
+        }
+        let children = (try fm.contentsOfDirectory(atPath: source.path)).sorted()
+        for name in children {
+            if skipRootNames.contains(name) {
+                log("已跳过受系统保护的元数据文件：\(name)（恢复后系统自动重建）")
+                continue
+            }
+            try cloneWithRetry(
+                source.appendingPathComponent(name),
+                destination.appendingPathComponent(name),
+                maxAttempts: maxAttempts, cloneOp: cloneOp, log: log)
+        }
+    }
+
+    /// 单个子项克隆，瞬时错误自动重试。
+    private static func cloneWithRetry(
+        _ source: URL, _ destination: URL,
+        maxAttempts: Int,
+        cloneOp: (URL, URL) throws -> Void,
+        log: (String) -> Void
+    ) throws {
         var attempt = 0
         while true {
             attempt += 1
             do {
                 try cloneOp(source, destination)
                 return
-            } catch CloneError.interrupted where attempt < maxAttempts {
-                log("克隆被中断，重试（第 \(attempt) 次）…")
+            } catch let error where attempt < maxAttempts && isTransient(error) {
+                log("克隆 \(source.lastPathComponent) 受阻，重试（第 \(attempt) 次）…")
                 usleep(200_000)
             }
+        }
+    }
+
+    /// 瞬时可重试错误：EINTR，以及系统逐文件审查高负载下偶发的 EPERM/EACCES。
+    static func isTransient(_ error: Error) -> Bool {
+        switch error as? CloneError {
+        case .interrupted: return true
+        case .failed(let code): return code == EPERM || code == EACCES
+        default: return false
         }
     }
 

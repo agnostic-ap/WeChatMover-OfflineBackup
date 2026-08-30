@@ -1122,10 +1122,11 @@ func runProcessSurvivesHugeStderrOutput() {
         let parent = root.appendingPathComponent(ContainerCloner.clonePrefix + "t", isDirectory: true)
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
         let clone = parent.appendingPathComponent("com.tencent.xinWeChat", isDirectory: true)
-        try ContainerCloner.cloneTree(source: src, to: clone)
-        let pruned = ContainerCloner.pruneProtectedFiles(inCloneRoot: clone)
+        var logs: [String] = []
+        try ContainerCloner.cloneTree(source: src, to: clone, log: { logs.append($0) })
 
-        #expect(pruned == [".com.apple.containermanagerd.metadata.plist"])
+        // 受保护 plist 在克隆阶段即被跳过（有日志），克隆里不存在
+        #expect(logs.contains { $0.contains("containermanagerd") })
         #expect(!FileManager.default.fileExists(
             atPath: clone.appendingPathComponent(".com.apple.containermanagerd.metadata.plist").path))
         // 源里的 plist 分毫未动
@@ -1143,21 +1144,25 @@ func runProcessSurvivesHugeStderrOutput() {
     }
 }
 
-@Test func cloneTreeRetriesOnInterruptedThenGivesUp() throws {
+@Test func cloneTreeRetriesOnTransientErrorsThenGivesUp() throws {
     try withTempDir { root in
-        let src = try makeDataDir(root: root, "s")
+        // 单一顶层子目录，便于精确计数（克隆按顶层子项逐个执行）
+        let src = root.appendingPathComponent("s", isDirectory: true)
+        try makeDataDir(root: src, "inner")
         let dst = root.appendingPathComponent("d")
-        // 前两次 EINTR，第三次成功
+        // 第 1 次 EINTR、第 2 次瞬时 EPERM，第 3 次成功
         var calls = 0
         try ContainerCloner.cloneTree(source: src, to: dst, cloneOp: { from, to in
             calls += 1
-            if calls < 3 { throw ContainerCloner.CloneError.interrupted }
+            if calls == 1 { throw ContainerCloner.CloneError.interrupted }
+            if calls == 2 { throw ContainerCloner.CloneError.failed(errno: EPERM) }
             try ContainerCloner.systemCloneFile(from, to)
         })
         #expect(calls == 3)
-        #expect(FileManager.default.fileExists(atPath: dst.appendingPathComponent("file0.bin").path))
+        #expect(FileManager.default.fileExists(
+            atPath: dst.appendingPathComponent("inner/file0.bin").path))
 
-        // 一直 EINTR → 到达上限后抛出
+        // 一直 EINTR → 到达上限后抛出；非瞬时错误（如 ENOENT）不重试
         var always = 0
         #expect(throws: ContainerCloner.CloneError.interrupted) {
             try ContainerCloner.cloneTree(
@@ -1165,6 +1170,13 @@ func runProcessSurvivesHugeStderrOutput() {
                 maxAttempts: 3, cloneOp: { _, _ in always += 1; throw ContainerCloner.CloneError.interrupted })
         }
         #expect(always == 3)
+        var once = 0
+        #expect(throws: ContainerCloner.CloneError.failed(errno: ENOENT)) {
+            try ContainerCloner.cloneTree(
+                source: src, to: root.appendingPathComponent("d3"),
+                cloneOp: { _, _ in once += 1; throw ContainerCloner.CloneError.failed(errno: ENOENT) })
+        }
+        #expect(once == 1)
     }
 }
 
