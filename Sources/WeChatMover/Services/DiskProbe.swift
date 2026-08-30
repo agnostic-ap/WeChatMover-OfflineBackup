@@ -1,12 +1,7 @@
 import Foundation
 
-/// 是否 APFS 等卷相关的探测。
+/// 卷相关的只读探测。
 enum DiskProbe {
-    /// 纯逻辑：根据 statfs 的文件系统类型名判断是否 APFS。
-    static func isAPFS(fsTypeName: String) -> Bool {
-        fsTypeName.lowercased() == "apfs"
-    }
-
     /// 读取路径所在卷的文件系统类型名（如 "apfs"、"exfat"、"ntfs"）。
     static func volumeFSType(path: String) -> String? {
         var s = statfs()
@@ -21,30 +16,6 @@ enum DiskProbe {
         guard let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path),
               let free = attrs[.systemFreeSize] as? Int64 else { return nil }
         return free
-    }
-
-    /// 递归统计目录大小（不跟随符号链接）。
-    static func directorySize(at url: URL) -> Int64 {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-        var total: Int64 = 0
-        for case let file as URL in enumerator {
-            guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                  values.isRegularFile == true else { continue }
-            total += Int64(values.fileSize ?? 0)
-        }
-        return total
-    }
-
-    /// 路径是否为符号链接。
-    static func isSymlink(_ url: URL) -> Bool {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let type = attrs[.type] as? FileAttributeType else { return false }
-        return type == .typeSymbolicLink
     }
 
     /// 路径所在卷的卷名（仅 UI 展示用，只读）。

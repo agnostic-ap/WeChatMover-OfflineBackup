@@ -18,8 +18,16 @@ if [ ! -d "$CLT_FRAMEWORKS/Testing.framework" ]; then
     exit 1
 fi
 
+# 新版 CLT 的 Testing.framework 还依赖 lib_TestingInterop.dylib（在 Library/Developer/usr/lib）。
+CLT_TESTING_LIB="/Library/Developer/CommandLineTools/Library/Developer/usr/lib"
+EXTRA_RPATH=()
+if [ -d "$CLT_TESTING_LIB" ]; then
+    EXTRA_RPATH=(-Xlinker -rpath -Xlinker "$CLT_TESTING_LIB")
+fi
+
 exec swift test \
     -Xswiftc -F -Xswiftc "$CLT_FRAMEWORKS" \
     -Xswiftc -Xfrontend -Xswiftc -disable-cross-import-overlays \
     -Xlinker -rpath -Xlinker "$CLT_FRAMEWORKS" \
+    "${EXTRA_RPATH[@]}" \
     "$@"

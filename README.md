@@ -1,161 +1,83 @@
-# WeChatMover
+# WeChatMover · 微信离线备份
 
-微信数据外置硬盘迁移工具（macOS / SwiftUI）。把微信（官网 DMG 版）容器里最占空间的几个数据目录迁移到外置硬盘的任意文件夹，原位留下同名符号链接，微信无感使用；支持一键还原。
+macOS / SwiftUI 的**微信数据离线整包备份与恢复工具**。完全退出微信后，把微信在本机的全部数据容器打包成带校验的时间戳快照写入移动硬盘（含 exFAT），随时可列表、验证、查看详情，并在需要时按计划安全恢复。
 
-> 使用者请直接看 [使用指南](使用指南.md)（面向普通用户的图文步骤）；本 README 面向开发者。
+> 使用者请直接看 [使用指南](使用指南.md)（面向普通用户）；本 README 面向开发者。
 
-## 原理
+本项目自 2.0 起从「软链接外置迁移工具」全面改造为「离线备份/恢复应用」：
 
-微信（官网版）的数据存放在沙盒容器内：
+- **不再**给微信重签名（不碰 `codesign`）、**不再**建符号链接、**不再**要求日常使用时插着外置硬盘。备份完成后硬盘即可拔下。
+- 旧版软链接迁移流程及相关文案已全部移除。
+
+## 备份哪些数据
+
+完全退出微信后，工具在当前系统用户的 home 下发现并备份微信全家（存在才备）：
+
+| 类别 | 路径（相对 `~`） | 说明 |
+| --- | --- | --- |
+| 主容器 | `Library/Containers/com.tencent.xinWeChat` | 聊天记录、文件、账号数据 |
+| 分享扩展容器 | `Library/Containers/com.tencent.xinWeChat.WeChatMacShare` | 分享扩展 |
+| 文件提供扩展容器 | `Library/Containers/com.tencent.xinWeChat.WeChatFileProviderExtension` | 访达文件集成 |
+| 共享群组容器 | `Library/Group Containers/5A4RE8SF68.com.tencent.xinWeChat` | 跨进程共享数据 |
+| 自动化脚本目录 | `Library/Application Scripts/com.tencent.xinWeChat*`、`…/5A4RE8SF68.com.tencent.xinWeChat*` | Application Scripts 授权目录 |
+| 微信应用本体（可选） | `/Applications/WeChat.app` | 勾选后归档同版本安装包；**恢复时绝不自动覆盖「应用程序」** |
+
+发现规则：三个父目录下、名称等于微信主 ID / 群组 ID 或以其加 `.` 开头的直接子目录（前缀白名单，自动覆盖未来新增的微信扩展容器）。
+
+## 快照格式
+
+外置盘上的布局（目录与文件名全为 exFAT 安全的 ASCII）：
 
 ```
-~/Library/Containers/com.tencent.xinWeChat/Data
+<你选择的文件夹>/WeChatBackups/
+  WeChatBackup-20260830-153000/
+    container-com.tencent.xinWeChat.zip
+    container-com.tencent.xinWeChat.WeChatMacShare.zip
+    …
+    manifest.json          # 清单
+    COMPLETE               # 完成标记（内容 = manifest.json 的 SHA-256）
 ```
 
-本工具只迁移以下三个子目录（存在且不是软链时）：
+- **归档**：系统 `ditto -c -k --sequesterRsrc --keepParent`。ZIP 单文件封装 macOS 扩展属性与资源叉（AppleDouble/`__MACOSX` 机制），因此**裸目录永不直接落上 exFAT**，元数据不丢；解包用 `ditto -x -k` 自动还原。
+- **manifest.json** 记录：格式版本、创建时间、工具版本、微信版本/build、macOS 版本，以及每个归档的源相对路径、文件数、逻辑大小、归档大小、SHA-256。
+- **完成标记**：所有归档与清单落盘后才写 `COMPLETE`；标记缺失或与清单哈希不符的快照显示为「未完成/损坏」，禁止用于恢复。备份过程写在 `*.inprogress` 目录中，成功后才改名。
 
-| 容器内路径 | 说明 |
-| --- | --- |
-| `Documents/xwechat_files` | 4.x 主力数据（聊天记录文件、图片视频等） |
-| `Documents/app_data` | 4.x 应用数据 |
-| `Library/Application Support/com.tencent.xinWeChat` | 3.x 兼容数据 |
+## 恢复流程的安全设计
 
-迁移后数据实际位于 `<你选择的文件夹>/WeChatData/<子目录名>`，原位置是同名符号链接。
+1. **默认只出计划**：展示每项的目标路径、大小、是否会让位现有数据，以及微信版本/磁盘空间检查结果；版本不一致必须勾选知情确认。
+2. **二次确认**：计划页确认后还有最终 destructive 确认。
+3. **先验证再动手**：逐归档校验 ZIP 条目路径安全（拒绝绝对路径、`..`、越出顶层目录）与 SHA-256；再检查磁盘空间。全部通过前不写一个字节。
+4. **先解压后落位**：全部解压到目标同级的 `*.wcm-staging-*` 暂存目录（同卷，落位仅是改名）。
+5. **原数据只改名，绝不静默删除**：现有目录改名为 `<原名>.wcm-rollback-<时间戳>` 保留原位；确认无误后由用户手动删除。
+6. **失败自动回滚**：任一步失败，已落位的新数据改名让位（`.wcm-failed-*`），回滚副本改回原名，恢复到操作前状态。
+7. **路径白名单**：一切危险操作（改名、落位、清理暂存）只允许发生在三个微信父目录下、微信家族名（含 `.wcm-*` 派生名）的直接子目录上，杜绝路径穿越；快照删除只允许 `WeChatBackups` 下的 `WeChatBackup-*` 目录。
 
-迁移流程：后台拷贝 → 大小校验 → 源目录改名为 `<原名>_backup`（**不删除**）→ 建软链 → 确认软链可达。任何一步失败都会自动回滚，不会丢数据。迁移完成后用 `codesign --sign - --force --deep /Applications/WeChat.app` 重签名并自动 `codesign -v` 复核，因为数据位置变化会破坏原签名校验。
+## 适用边界（务必阅读）
 
-重签名**不需要管理员密码/ root**：拖拽安装的微信，`/Applications/WeChat.app` 所有者就是当前用户，直接签即可。真正需要的是 macOS Ventura+ 的 **「App 管理」权限**（修改其他 App 的包需显式授权）——所以本工具在进程内直接执行 codesign，让该权限归责到 WeChatMover 自身，按提示授权一次即可；不能借 osascript 提权签，那样权限会归责到系统中间进程，授权了也永远写不进去。
+- **最可靠**：同一台 Mac、同一 macOS 用户、同版本微信、同一微信账号的「备份 → 恢复」。
+- **跨 Mac 恢复属实验性质**：微信可能要求重新登录、部分数据可能不被识别，成功率不保证。
+- **不能替代官方备份**：请与微信官方「聊天记录备份与迁移」并存使用，重要记录多一份保险。
+- 本工具不修改微信、不重签名，微信不需要重新签名即可正常使用。
 
-### 已迁移后更改目标位置（数据转移）
-
-已迁移状态下点「更改…」提供两种模式：
-
-- **转移数据到新位置**（完整搬家）：第一重确认（当前位置 + 后果说明）→ 选择新位置 → 第二重确认（数据大小 + 耗时提示）→ 自动退出微信后逐项 拷贝 → 校验 → 软链换指向 → 清除旧位置数据，任何一步失败都会回滚（软链指回原位置）。转移期间微信不可用，完成后自动重签名。新位置强烈建议 APFS 格式（非 APFS 会给强提示但不禁止）。
-- **不转移，只改目标位置**：不拷贝任何数据。选完新位置后再二选一——「新位置已有数据，直接改指过去」仅把软链换指向新位置（逐项预检，缺数据的项保持原指向并提示，可补齐后重跑续传；全部改指成功才更新记录并重签名，旧位置数据保留不删）；「只更新记录，数据和链接不动」仅更新工具记录的目标位置（适用于已自行处理好数据和链接的情况）。
-
-**转移中途断联/失败是安全的**：删除旧数据永远是最后一步，逐项"先复制、校验通过后才删旧"。中途断盘时失败信息会明确告诉你每项数据的实际位置（已转移的在新位置、其余在原位置，数据完整）；重新连接后再次执行「更改…」即可续传——已转移的项会被自动跳过（幂等）。
-
-### 关于 `_backup` 备份
-
-迁移成功后，原数据以 `xwechat_files_backup` 等形式保留在内置盘原位——这是一份保险，意味着**空间尚未释放**。确认微信在外置盘上运行正常后，点击「清理备份…」清理（工具会逐项检查软链有效才删，删除前显示可释放的空间并二次确认）。若软链失效（如外置盘未插），删除会被拒绝。
-
-「还原外置存储数据到 Mac…」优先使用本地 `_backup`：删掉软链、把备份改名回原名即可秒还原（外置盘上的副本会保留不动）；若备份已被删除，则从外置盘完整拷回内置盘并校验。
-
-迁移完成时会向 `<目标文件夹>/WeChatData/manifest.json` 写入清单（逐项记录迁移时刻的目录指纹：相对路径+大小+mtime 的 stat 聚合，不读文件内容）。还原前工具据此做**新旧判定**（无 manifest 的旧迁移自动降级为双侧指纹对比，外置盘不可读时跳过比对按原流程继续）：
-
-- **还原外置存储数据到 Mac**：外置有更新 → 直接使用外置数据还原（不再打扰）；两侧一致 → 提示可选择「使用内置备份（更快）」或「仍从外置硬盘拷贝」。
-- **还原内置存储数据到 Mac**：外置有更新 → 提示「改用外置数据还原（推荐）」/「仍使用内置备份」；两侧一致或外置盘未连接 → 直接使用内置备份秒还原。
-
-若上次迁移中途失败留下残留（`_backup` 存在但源位不是软链），工具会红色警示并阻止再次迁移，按提示手工检查（一般把 `_backup` 改名回原名即可恢复）后再操作。
-
-## 重要前提
-
-- **只支持微信官网 DMG 版**（https://weixin.qq.com/ 下载）。App Store 版受沙盒限制，软链无效；本工具检测到 App Store 版会禁用迁移并引导你去官网下载。
-- **目标卷强烈建议为 APFS**。exFAT / NTFS 等格式不支持符号链接与稀疏文件，会导致空间膨胀甚至失败。工具检测到非 APFS 会在横幅和确认框给出醒目警告，但不强制禁止——仍要继续由你自己决定。
-- 迁移前需要退出微信：点击「迁移到外置硬盘」后会弹确认框，确认「退出微信并开始迁移」即可（优先优雅退出，几秒后未退出则强制结束，无需管理员密码）。
-- **外置盘未连接时不要打开微信**，否则微信会在原位新建空数据目录。工具启动时会检测软链可达性并红色警示。
-- 迁移后 macOS 会重置微信的部分权限（屏幕录制、麦克风），首次使用时按工具内的指引重新授权。
-- 微信更新会恢复官方签名（仅验封条会误判"签名有效"，但官方签名 + 软链数据打不开微信）：检测升级为三态（ad-hoc / 官方签名 / 已失效），已迁移时官方签名会被列为待处理项；版本变化时自动后台复检。「重新签名微信」按钮在安全检查详情里常驻，微信或 macOS 更新后打不开时随时可点。
-
-## 构建
-
-无需 Xcode，仅需 Command Line Tools（Swift 6）：
+## 构建与测试
 
 ```bash
-bash Scripts/build_app.sh
+bash Scripts/test.sh        # 单元测试（Swift Testing；全部使用临时目录 fixture，绝不触碰真实微信数据）
+bash Scripts/build_app.sh   # 出 arm64 + x86_64 通用 WeChatMover.app（ad-hoc 签名的是本工具自身）
 ```
 
-产物在 `build/WeChatMover.app`（arm64 + x86_64 通用包，Apple 芯片与 Intel Mac 均可运行，已 ad-hoc 签名），拖到「应用程序」或直接双击运行即可。
-
-## 测试
-
-```bash
-# 装了完整 Xcode 的机器：
-swift test
-
-# 只有 Command Line Tools 的机器（SwiftPM 找不到 CLT 自带的 Testing.framework，需补参数）：
-bash Scripts/test.sh
-```
-
-测试全部使用临时目录构造的假数据，不会触碰真实微信数据。
-
-## 使用步骤
-
-1. 打开 WeChatMover，确认状态面板识别到微信版本且不是 App Store 版。
-2. 若提示无法读取微信数据目录，点击按钮跳转「完全磁盘访问权限」，授权后重启本 App。
-3. 在「目标位置」选择一个外置硬盘上的文件夹；留意磁盘格式（需 APFS）与剩余空间。
-4. 点击「迁移到外置硬盘」，确认对话框中选择「退出微信并开始迁移」。
-5. 迁移完成后工具自动重签名微信并复核；首次可能弹「App 管理」授权指引，按提示授权一次即可（不需要输入密码）。
-6. 完成后按指引重新授权屏幕录制/麦克风权限。
-7. 打开微信确认一切正常后，回到本工具点击「清理备份…」释放内置盘空间。
-
-还原：点击「还原外置存储数据到 Mac…」（红色确认）。本地 `_backup` 还在时秒还原（改名回去即可）；备份已删则从外置盘完整拷回。完成后再次重签名。若微信正在运行，确认后会先自动退出微信再继续（与迁移一致）。
-
-两个相似入口的区别：
-
-- **还原内置存储数据到 Mac…**：从本地 `_backup` 还原，放弃迁移，回到 Mac 上的旧数据。删除软链、把 `_backup` 改名回原名，全程不访问外置硬盘（不插盘也能用），外置数据保留不动。仅当已迁移且本地 `_backup` 存在时可用。
-- **还原外置存储数据到 Mac…**：从外置盘把最新数据搬回来（备份还在时与前者效果相同；备份已删时走完整拷回）。
-
-若已用内置备份还原、事后发现外置数据更新：外置数据行的「用外置数据覆盖内置…」会先比对指纹，确认后把当前内置数据备份为 `_backup`（安全网，可再还原或清理），再把外置数据拷回内置盘；外置数据保留不动。
-
-还原后外置盘上的 `<目标文件夹>/WeChatData` 会保留（安全设计）。确认不再需要后，点「清理外置数据…」手动删除：按钮只在没有任何符号链接还指向外置数据时（即还原之后）点亮，已迁移状态置灰并提示「还原数据到 Mac 后可清理」；删除前仍会做使用中与路径校验，显示占用大小并二次确认后才删除。
-
-## 常见问题
-
-### 重签名失败：Operation not permitted
-
-macOS Ventura 及以上有「App 管理」权限：修改其他 App 的包（含 codesign 重签名）必须显式授权。本工具直接执行 codesign（不弹密码框），权限归责到 WeChatMover 自身。日志出现 `Operation not permitted` 时，工具会自动弹出指引：
-
-1. 点指引里的按钮打开 系统设置 → 隐私与安全性 → **App 管理**，打开 WeChatMover 的开关（列表中没有就点「+」添加）；
-2. 回到工具点「重试重签名」。
-
-兜底方案：在「终端」里执行（终端通常已有该权限，一般能成功，指引弹窗里有「复制命令」按钮）：
-
-```bash
-sudo codesign --sign - --force --deep /Applications/WeChat.app
-```
-
-### 迁移失败：目标位置已存在数据
-
-说明目标文件夹里已有 `WeChatData/<子目录>`，通常来自上次迁移中断或重复迁移。工具会一次收集全部冲突项并弹确认框，三个选项：「直接使用外置数据」不拷贝，本地数据备份为 `_backup` 后建软链直接使用外置已有数据（外置数据本身是完整的时最省事）；「删除旧数据并重新迁移」会删掉旧数据后自动重跑（删除前请确认旧数据无用）；「取消」则可手工检查后重试。
-
-## 项目结构
+代码结构：
 
 ```
 Sources/WeChatMover/
-├── WeChatMoverApp.swift       # @main 入口（窗口 920×680，最小 760×580）
-├── Models/
-│   ├── Paths.swift            # 容器路径与目标路径映射
-│   ├── Presentation.swift     # 展示模型：AppStatus/BannerModel/StatusCardModel/弹窗枚举/文案映射
-│   └── MigrationState.swift   # 状态枚举 + 视图模型（业务状态 → 展示模型）
-├── Services/
-│   ├── WeChatDetector.swift   # 安装/版本/App Store 版/运行中/签名校验
-│   ├── DiskProbe.swift        # 卷格式(APFS)、卷名、剩余空间、目录大小
-│   ├── Migrator.swift         # 迁移/还原核心（拷贝→校验→源改名 _backup→建软链，带回滚）
-│   ├── CodeSigner.swift       # codesign 直签（不提权）+ 结果分类/复核
-│   ├── WeChatQuitter.swift    # 退出微信（优雅退出 → 必要时强杀）
-│   └── PermissionHelper.swift # TCC 检测与系统设置深链
-└── Views/                     # SwiftUI 界面（简体中文），按 UI 设计规范拆分：
-    ├── DesignTokens.swift         # 颜色/间距/圆角 tokens（深浅色自适应，微信绿 accent）
-    ├── ContentView.swift          # 仪表盘根视图 + 单一枚举驱动的弹窗/弹层
-    ├── ReadinessBanner.swift      # 就绪状态横幅（五态）
-    ├── StatusSummaryGrid.swift    # 三张摘要卡片 + 安全检查详情
-    ├── DestinationPickerRow.swift # 目标位置整行选择器（只读路径/空状态）
-    ├── ActionSection.swift        # 主操作区/迁移进度面板 + 备份与外置数据管理行
-    ├── LogDisclosureGroup.swift   # 可折叠日志（复制/导出/清空）
-    ├── GuideView.swift            # 权限重新授权指南（先移除再添加）
-    └── AppManagementGuideView.swift # 重签名受阻指引（App 管理/终端兜底）
-Scripts/
-├── build_app.sh               # 构建并组装 .app（ad-hoc 签名）
-├── make_icon.swift            # AppKit 离屏绘制应用图标（微信绿气泡+右箭头）
-├── make_icon.sh               # 重新生成 Resources/AppIcon.icns（绘制 + iconutil）
-└── test.sh                    # CLT 环境下跑 Swift Testing 的包装脚本
+  Models/     BackupComponents（组件发现 + PathGuard 白名单）、BackupManifest、AppViewModel、Presentation
+  Services/   ZipArchiver（ditto/zipinfo）、Checksum（SHA-256）、VaultStore（快照仓库）、
+              BackupEngine、RestoreEngine、WeChatDetector、WeChatQuitter、DiskProbe、PermissionHelper
+  Views/      SwiftUI 中文界面（备份区、快照列表、恢复计划、快照详情、日志）
 ```
 
-## 免责声明
+## 许可与署名
 
-本工具与腾讯/微信无任何关联。操作涉及数据迁移，虽有多重校验与回滚，仍建议重要数据先备份。使用风险自负。
+MIT 许可证，见 [LICENSE](LICENSE)。
 
-## 许可
-
-MIT，见 [LICENSE](LICENSE)。
+本项目基于上游 [pipipiper/WeChatMover](https://github.com/pipipiper/WeChatMover)（MIT）改造而来，感谢原作者的探索与代码基础；2.0 的备份/恢复形态与上游的软链接迁移形态定位不同，请按各自 README 使用。
