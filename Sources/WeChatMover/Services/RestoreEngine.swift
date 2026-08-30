@@ -145,7 +145,7 @@ enum RestoreEngine {
         log("✅ 全部归档校验通过")
 
         // 2. 空间检查：暂存解压需要全部逻辑大小 + 余量（原数据只改名不删，不占新空间）。
-        if let free = DiskProbe.freeSpace(path: home.path),
+        if let free = DiskProbe.usableSpace(path: home.path),
            free < plan.totalLogicalSize + spaceMargin {
             throw BackupError.insufficientSpace(
                 need: plan.totalLogicalSize + spaceMargin, free: free)

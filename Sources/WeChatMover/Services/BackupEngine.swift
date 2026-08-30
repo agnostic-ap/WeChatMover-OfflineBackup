@@ -109,7 +109,7 @@ enum BackupEngine {
             if component.kind != .application {
                 let parent = ContainerCloner.makeCloneParent()
                 let need = ContainerCloner.estimatedCloneOverhead(fileCount: entryStats.fileCount)
-                let free = DiskProbe.freeSpace(path: fm.temporaryDirectory.path) ?? .max
+                let free = DiskProbe.usableSpace(path: fm.temporaryDirectory.path) ?? .max
                 if free > need {
                     do {
                         try fm.createDirectory(at: parent, withIntermediateDirectories: true)

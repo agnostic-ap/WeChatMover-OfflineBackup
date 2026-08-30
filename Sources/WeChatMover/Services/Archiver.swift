@@ -80,46 +80,66 @@ enum Archiver {
         var stderr: String
     }
 
-    /// 子进程输出一律重定向到临时文件，退出后再读取。
-    /// 不能用 Pipe：ditto 遇到问题文件会向 stderr 连续输出警告，
-    /// 一旦灌满 64KB 管道缓冲而读取方还在等另一条管道的 EOF，
-    /// 双方互等造成死锁（大容量备份实测踩中）。文件重定向无此问题。
+    /// 线程安全的管道累积缓冲。
+    private final class PipeBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func append(_ chunk: Data) { lock.lock(); data.append(chunk); lock.unlock() }
+        var contents: Data { lock.lock(); defer { lock.unlock() }; return data }
+    }
+
+    /// 双管道并发读取（readabilityHandler），两路同时排空：
+    /// - 不能顺序读两条管道：归档工具遇到问题文件会向 stderr 连续输出警告，
+    ///   灌满 64KB 管道缓冲而读取方还在等另一条的 EOF 时双方互等死锁（实测踩中）；
+    /// - 也不能重定向到磁盘临时文件：本地盘临界满时连 0 字节文件都建不出来
+    ///   （实测踩中），进程执行不应依赖本地盘余量。
     static func runProcess(_ path: String, _ arguments: [String]) -> ProcessResult {
-        let fm = FileManager.default
-        let tmp = fm.temporaryDirectory
-        let outURL = tmp.appendingPathComponent("wcm-proc-\(UUID().uuidString).out")
-        let errURL = tmp.appendingPathComponent("wcm-proc-\(UUID().uuidString).err")
-        fm.createFile(atPath: outURL.path, contents: nil)
-        fm.createFile(atPath: errURL.path, contents: nil)
-        defer {
-            try? fm.removeItem(at: outURL)
-            try? fm.removeItem(at: errURL)
-        }
-        guard let outHandle = try? FileHandle(forWritingTo: outURL),
-              let errHandle = try? FileHandle(forWritingTo: errURL) else {
-            return ProcessResult(status: -1, stdout: "", stderr: "无法创建临时输出文件")
-        }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
-        process.standardOutput = outHandle
-        process.standardError = errHandle
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        let outBuf = PipeBuffer()
+        let errBuf = PipeBuffer()
+        let outDone = DispatchSemaphore(value: 0)
+        let errDone = DispatchSemaphore(value: 0)
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                outDone.signal()
+            } else {
+                outBuf.append(chunk)
+            }
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                errDone.signal()
+            } else {
+                errBuf.append(chunk)
+            }
+        }
+
         do {
             try process.run()
         } catch {
-            try? outHandle.close()
-            try? errHandle.close()
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            errPipe.fileHandleForReading.readabilityHandler = nil
             return ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
         }
+        // 先等两路 EOF（子进程退出后管道写端关闭），再取退出码。
+        outDone.wait()
+        errDone.wait()
         process.waitUntilExit()
-        try? outHandle.close()
-        try? errHandle.close()
-        let outData = (try? Data(contentsOf: outURL)) ?? Data()
-        let errData = (try? Data(contentsOf: errURL)) ?? Data()
         return ProcessResult(
             status: process.terminationStatus,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? "")
+            stdout: String(data: outBuf.contents, encoding: .utf8) ?? "",
+            stderr: String(data: errBuf.contents, encoding: .utf8) ?? "")
     }
 
     /// 错误消息用的 stderr 截断（警告可能有几万行，弹窗只展示开头）。

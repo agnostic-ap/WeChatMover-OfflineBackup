@@ -18,6 +18,20 @@ enum DiskProbe {
         return free
     }
 
+    /// 真实可用空间：volumeAvailableCapacityForImportantUsage（系统可为重要
+    /// 写入清理 purgeable 后的可用量）。systemFreeSize 在磁盘临界满时被
+    /// purgeable 空间虚高（实测 df 显示 2.8G 可用但 0 字节文件都建不出来），
+    /// 本地盘（克隆/恢复暂存）的空间预检必须用这个。取不到时退回 freeSpace。
+    static func usableSpace(path: String) -> Int64? {
+        if let values = try? URL(fileURLWithPath: path)
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+           let capacity = values.volumeAvailableCapacityForImportantUsage,
+           capacity > 0 {
+            return capacity
+        }
+        return freeSpace(path: path)
+    }
+
     /// 路径所在卷的卷名（仅 UI 展示用，只读）。
     static func volumeName(path: String) -> String? {
         try? URL(fileURLWithPath: path)
