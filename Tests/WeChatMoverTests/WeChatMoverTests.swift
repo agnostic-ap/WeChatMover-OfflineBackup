@@ -1010,3 +1010,67 @@ private struct TestMoveError: Error, Equatable { let tag: String }
         #expect(!siblings.contains { $0.contains(".wcm-") })
     }
 }
+
+// MARK: - 归档后/逐项落位前的微信重开复查（最小安全修复）
+
+@Test func backupSingleComponentAbortsWhenWeChatReopensDuringArchive() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let main = try #require(env.discoverComponents().first {
+            $0.id == "container-com.tencent.xinWeChat"
+        })
+        var calls = 0
+        #expect(throws: BackupError.wechatStillRunning) {
+            // 1=首写前 2=归档前 3=归档完成后：唯一组件归档期间微信重开
+            _ = try runBackup(
+                makeBackupRequest(env: env, vault: vault, components: [main]),
+                isWeChatRunning: { calls += 1; return calls >= 3 })
+        }
+        #expect(calls == 3)
+        // 本次 .inprogress 已删除，不生成快照
+        let entries = (try? FileManager.default.contentsOfDirectory(
+            atPath: VaultStore.vaultRoot(base: vault).path)) ?? []
+        #expect(entries.isEmpty)
+        #expect(VaultStore.listSnapshots(base: vault).isEmpty)
+    }
+}
+
+@Test func restoreRollsBackWhenWeChatReopensAfterFirstCommit() throws {
+    try withTempDir { root in
+        let vault = root.appendingPathComponent("vault")
+        let env = try makeFixtureHome(root.appendingPathComponent("home"))
+        let mainDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat", isDirectory: true)
+        let marker = mainDir.appendingPathComponent("Data/Documents/file0.bin")
+        let fpDir = env.home.appendingPathComponent(
+            "Library/Containers/com.tencent.xinWeChat.WeChatFileProviderExtension", isDirectory: true)
+        let snapshot = try runBackup(makeBackupRequest(env: env, vault: vault))
+        try Data("恢复前的现网数据".utf8).write(to: marker)
+
+        let plan = try RestoreEngine.makePlan(
+            snapshot: snapshot, environment: env, currentWeChatVersion: "4.0.6")
+        #expect(plan.items.count > 1)
+        let fpBefore = FileStats.measure(at: fpDir)
+
+        var calls = 0
+        #expect(throws: BackupError.wechatStillRunning) {
+            // 1=解压前 2=落位循环前 3=第一项动手前 4=第二项动手前：
+            // 第一项已提交后微信重开 → 必须完整回滚再抛错
+            _ = try runRestore(
+                plan: plan, environment: env,
+                isWeChatRunning: { calls += 1; return calls >= 4 })
+        }
+        #expect(calls == 4)
+        // 第一项已完整回滚：恢复前的数据回到原位
+        #expect(try Data(contentsOf: marker) == Data("恢复前的现网数据".utf8))
+        // 无 rollback/staging 残留；第一项失败落位的副本以 .wcm-failed 保留（未删除）
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: mainDir.deletingLastPathComponent().path)
+        #expect(!siblings.contains { $0.contains(".wcm-rollback-") })
+        #expect(!siblings.contains { $0.contains(".wcm-staging-") })
+        #expect(siblings.contains { $0.hasPrefix("com.tencent.xinWeChat.wcm-failed-") })
+        // 未轮到的目标分毫未动
+        #expect(FileStats.measure(at: fpDir) == fpBefore)
+    }
+}

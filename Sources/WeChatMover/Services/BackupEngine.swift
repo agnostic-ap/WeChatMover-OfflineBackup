@@ -108,6 +108,9 @@ enum BackupEngine {
             } catch {
                 try cleanupAndThrow(error)
             }
+            // 归档完成后复查：本组件归档期间微信重开，内容不可信，
+            // 即便是唯一/最后一个组件也整体作废，不生成快照。
+            if isWeChatRunning() { try cleanupAndThrow(BackupError.wechatStillRunning) }
             let s = stats[component.id] ?? (0, 0)
             let archiveSize = (try? fm.attributesOfItem(atPath: archiveURL.path)[.size] as? Int64)
                 .flatMap { $0 } ?? 0

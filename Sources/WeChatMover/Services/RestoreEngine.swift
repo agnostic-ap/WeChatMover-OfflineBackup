@@ -257,6 +257,15 @@ enum RestoreEngine {
         }
         var rollbackDirs: [String] = []
         for (item, stagedURL, _) in staged {
+            // 每项做任何改名/落位前复查微信：尚未提交任何项时仅清暂存后中止；
+            // 已有提交项则先走可靠回滚流程，再抛 wechatStillRunning。
+            if isWeChatRunning() {
+                if committed.isEmpty {
+                    cleanupStaging()
+                    throw BackupError.wechatStillRunning
+                }
+                try rollbackCommitted(BackupError.wechatStillRunning)
+            }
             let name = item.targetURL.lastPathComponent
             var rollback: URL? = nil
             if fm.fileExists(atPath: item.targetURL.path) {
