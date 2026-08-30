@@ -47,10 +47,16 @@ enum Archiver {
 
     // MARK: - 条目路径安全（防路径穿越，纯函数可单测）
 
-    /// 返回不安全条目：绝对路径、含 ".." 组件、反斜杠或以 ~ 开头。
+    /// 返回不安全条目：绝对路径、含 ".." 组件或以 ~ 开头。
+    ///
+    /// 注意不能把反斜杠判为不安全：bsdtar 列条目时会把非 ASCII 字节
+    /// 转成八进制转义（中文文件名如「2024年合同.xls」→ "2024\\345\\271\\264…"，
+    /// 微信收到的文件大量命中，实测 45GB 归档因此被误杀）；tar 中反斜杠
+    /// 也不是路径分隔符。穿越所需的 "/"、"." 都是 ASCII 可打印字符，
+    /// bsdtar 永远原样输出，检测不受转义影响。
     static func unsafeEntries(_ entries: [String]) -> [String] {
         entries.filter { entry in
-            entry.hasPrefix("/") || entry.hasPrefix("~") || entry.contains("\\")
+            entry.hasPrefix("/") || entry.hasPrefix("~")
                 || entry.split(separator: "/").contains("..")
         }
     }

@@ -196,21 +196,38 @@ private func runRestore(
 
 // MARK: - ZIP 条目安全（纯函数）
 
-@Test func unsafeZipEntriesDetection() {
+@Test func unsafeArchiveEntriesDetection() {
     let entries = [
         "ok/file.txt",
         "ok/nested/dir/",
+        "ok/2024\\345\\271\\264\\345\\220\\210.xls",  // bsdtar 对中文名的八进制转义：安全
+        "a\\..\\b",                 // 反斜杠非 tar 路径分隔符：安全（只是个怪名字）
         "/etc/passwd",              // 绝对路径
         "../escape.txt",            // 上跳
         "a/../../b.txt",            // 内嵌上跳
         "~root/x",                  // ~ 开头
-        "a\\..\\b",                 // 反斜杠
         "weird/..",                 // 结尾上跳
     ]
     let unsafe = Archiver.unsafeEntries(entries)
     #expect(unsafe.sorted() == [
-        "/etc/passwd", "../escape.txt", "a/../../b.txt", "a\\..\\b", "weird/..", "~root/x",
+        "/etc/passwd", "../escape.txt", "a/../../b.txt", "weird/..", "~root/x",
     ].sorted())
+}
+
+@Test func chineseFilenamesSurviveArchiveValidation() throws {
+    // 回归：微信收到的中文文件名（bsdtar 列条目转义成八进制）
+    // 不得被安全校验误杀（实测 45GB 归档因此被整体作废）。
+    try withTempDir { dir in
+        let src = dir.appendingPathComponent("payload", isDirectory: true)
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        try Data("测试".utf8).write(to: src.appendingPathComponent("2024年国网EAP服务合同.xls"))
+        try Data("测试".utf8).write(to: src.appendingPathComponent("行政部薪资转账汇总(1).pdf"))
+        let archive = dir.appendingPathComponent("p.tar")
+        try Archiver.createArchive(source: src, archive: archive)
+        let entries = try Archiver.listEntries(archive: archive)
+        try Archiver.validateEntries(entries, expectedTopLevel: "payload")   // 不得抛出
+        #expect(entries.count >= 3)
+    }
 }
 
 @Test func validateEntriesRejectsStrayTopLevel() throws {
