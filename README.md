@@ -2,6 +2,8 @@
 
 macOS / SwiftUI 的**微信数据离线整包备份与恢复工具**。完全退出微信后，把微信在本机的全部数据容器打包成带校验的时间戳快照写入移动硬盘（含 exFAT），随时可列表、验证、查看详情，并在需要时按计划安全恢复。
 
+项目主页：[agnostic-ap/WeChatMover-OfflineBackup](https://github.com/agnostic-ap/WeChatMover-OfflineBackup)
+
 > 使用者请直接看 [使用指南](使用指南.md)（面向普通用户）；本 README 面向开发者。
 
 本项目自 2.0 起从「软链接外置迁移工具」全面改造为「离线备份/恢复应用」：

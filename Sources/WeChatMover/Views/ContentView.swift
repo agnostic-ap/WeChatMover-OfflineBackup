@@ -81,7 +81,7 @@ struct ContentView: View {
 
     private var githubFooter: some View {
         Button {
-            NSWorkspace.shared.open(URL(string: "https://github.com/pipipiper/WeChatMover")!)
+            NSWorkspace.shared.open(URL(string: "https://github.com/agnostic-ap/WeChatMover-OfflineBackup")!)
         } label: {
             HStack(spacing: 6) {
                 if let mark = Self.githubMark {
@@ -89,7 +89,7 @@ struct ContentView: View {
                         .resizable()
                         .frame(width: 14, height: 14)
                 }
-                Text("github.com/pipipiper/WeChatMover")
+                Text("github.com/agnostic-ap/WeChatMover-OfflineBackup")
                     .font(.caption)
             }
             .foregroundStyle(.secondary)
